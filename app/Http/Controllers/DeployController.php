@@ -3,9 +3,12 @@
 namespace App\Http\Controllers;
 
 use App\Jobs\RunDeploymentJob;
+use App\Models\DeployLog;
 use App\Models\Deployment;
 use App\Models\Server;
 use App\Models\Site;
+use App\Services\AtomicReleaseService;
+use App\Services\SshService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -234,6 +237,68 @@ class DeployController extends Controller
             ->where('commit_hash', $commit)
             ->where('status', 'success')
             ->exists();
+    }
+
+    /**
+     * Phase 2 manual rollback: point `current` at this deployment's release.
+     *
+     * Only meaningful for atomic sites — in_place deploys overwrite in place and
+     * have nothing to go back to. The release folder must still exist (pruning
+     * keeps `keep_releases`, so old ones do eventually go).
+     */
+    public function rollback(Deployment $deployment): RedirectResponse
+    {
+        $this->authorizeDeployment($deployment);
+
+        $site = $deployment->site;
+
+        if (! $site || ! $site->isAtomic()) {
+            return back()->with('error',
+                'This site uses in_place deploys, which cannot be rolled back. '
+                .'Convert it with `php artisan deploy:convert-atomic` first.');
+        }
+
+        if (! $deployment->release_path) {
+            return back()->with('error', 'This deployment has no release directory recorded.');
+        }
+
+        $ssh = new SshService($site->server);
+
+        try {
+            $ssh->connect();
+
+            $exists = $ssh->exec('[ -d '.escapeshellarg($deployment->release_path).' ] && echo yes || echo no');
+
+            if (trim($exists['output'] ?? '') !== 'yes') {
+                return back()->with('error',
+                    'Release '.basename($deployment->release_path).' no longer exists on the server '
+                    .'— it was pruned. Increase "keep releases" on the site to retain more.');
+            }
+
+            $atomic = new AtomicReleaseService($ssh);
+            $atomic->switchTo($site, $deployment->release_path);
+            $reload = $atomic->reload($site);
+
+            DeployLog::record($deployment->id, 6, 32, 'success', null,
+                'Manual rollback: current → '.basename($deployment->release_path)
+                .($reload['skipped'] ? ' (no reload_command set — opcache may lag)' : ' and PHP-FPM reloaded'));
+
+            $ranMigrations = $deployment->logs()
+                ->where('phase', 4)->where('step', 16)->where('status', 'success')->exists();
+
+            $message = 'Rolled back to release '.basename($deployment->release_path).'.';
+
+            if ($ranMigrations) {
+                $message .= ' Note: that deploy ran migrations — the schema was NOT reverted, '
+                    .'only the code.';
+            }
+
+            return back()->with('success', $message);
+        } catch (\Throwable $e) {
+            return back()->with('error', 'Rollback failed: '.$e->getMessage());
+        } finally {
+            $ssh->disconnect();
+        }
     }
 
     public function poll(Deployment $deployment): JsonResponse

@@ -39,6 +39,35 @@ class DeployService
     private bool $maintenanceOn = false;
 
     /**
+     * Where this deploy writes code.
+     *
+     * Atomic sites (Phase 2) build into releases/{deployment_id} and only flip
+     * the `current` symlink once everything succeeds. in_place sites write
+     * straight into deploy_path exactly as before, so this stays null for them
+     * and every path helper falls back to the old behaviour.
+     */
+    private ?string $releasePath = null;
+
+    private ?AtomicReleaseService $atomic = null;
+
+    /** Code directory for this deploy: the new release, or deploy_path. */
+    private function targetPath(): string
+    {
+        return $this->releasePath ?? $this->site->deploy_path;
+    }
+
+    /**
+     * Directory holding runtime state (storage/, .env). Atomic sites keep these
+     * in shared/ so they outlive any single release.
+     */
+    private function statePath(): string
+    {
+        return $this->site->isAtomic()
+            ? $this->site->sharedPath()
+            : rtrim($this->site->deploy_path, '/');
+    }
+
+    /**
      * Run a local build command and fail loudly if it fails.
      *
      * shell_exec() returns only stdout and discards the exit code, so a failed
@@ -125,6 +154,12 @@ class DeployService
         try {
             $this->phase1PreFlight();
 
+            // Phase 2 (atomic): prepare releases/ + shared/ and record what
+            // `current` points at, so a failure can swap straight back to it.
+            if ($this->site->isAtomic()) {
+                $this->beginAtomicRelease();
+            }
+
             // Three deploy modes:
             // Mode B: source_path set → build from local folder, zip, upload
             // Mode C: repo_url set   → clone from git, build, zip, upload
@@ -143,6 +178,11 @@ class DeployService
 
             $this->phase4RemoteCommands();
 
+            // The live site still serves the OLD release until this point.
+            if ($this->site->isAtomic()) {
+                $this->completeAtomicRelease();
+            }
+
             $healthy = $this->phase5HealthCheck();
 
             if (! $healthy) {
@@ -150,10 +190,18 @@ class DeployService
                 $this->phase6Rollback($lastErrorLog);
             } else {
                 $deployment->markFinished('success');
+
+                if ($this->site->isAtomic()) {
+                    $this->log(2, 29, 'info', null,
+                        $this->atomic()->prune($this->site, $this->deployment));
+                }
             }
         } catch (\Throwable $e) {
             $this->log(0, 0, 'error', null, $e->getMessage());
             $this->liftMaintenance();
+            // An atomic failure before the switch leaves `current` untouched,
+            // so the live site was never affected — say so explicitly.
+            $this->reportAtomicFailureState();
             $deployment->markFinished('failed');
             throw $e;
         } finally {
@@ -397,7 +445,8 @@ class DeployService
         $this->ssh->reconnect();
 
         // Step 12: Extract + cleanup in one single exec to avoid channel-reuse errors
-        $deployPath = $this->site->deploy_path;
+        // Atomic sites extract into releases/{id}; in_place writes deploy_path.
+        $deployPath = $this->targetPath();
         $path = escapeshellarg($deployPath);
         $remoteTmpQ = escapeshellarg($remoteTmp);
         // A non-root SSH user can't overwrite files the previous deploy handed to
@@ -589,7 +638,7 @@ class DeployService
         @unlink($assetZip);
         $this->ssh->reconnect();
 
-        $remoteTarget = escapeshellarg($this->site->deploy_path.'/storage/app/public');
+        $remoteTarget = escapeshellarg($this->statePath().'/storage/app/public');
         $remoteTmpQ = escapeshellarg($remoteTmp);
         $this->ssh->exec(
             "mkdir -p {$remoteTarget} && ".
@@ -686,7 +735,8 @@ class DeployService
 
         // Write .env to remote server before any artisan commands
         if ($this->site->env_content) {
-            $envPath = $this->site->deploy_path.'/.env';
+            // Atomic: .env lives in shared/ and the release symlinks to it.
+            $envPath = $this->statePath().'/.env';
             $this->ssh->uploadContent($this->site->env_content, $envPath);
             $this->log(4, 14, 'success', null, '.env written to '.$envPath.' (credentials masked)');
         } else {
@@ -696,6 +746,15 @@ class DeployService
         // Reconnect SSH to get a fresh exec channel after SFTP uploadContent()
         // (phpseclib SSH2 can fail with "Please close the channel" otherwise).
         $this->ssh->reconnect();
+
+        // Atomic: point the release at shared/.env and shared/storage before any
+        // artisan command runs — they all need a readable .env, and the release's
+        // own storage/ must not shadow the shared one.
+        if ($this->site->isAtomic()) {
+            $this->atomic()->linkShared($this->site, $this->releasePath);
+            $this->log(4, 14, 'success', null,
+                'Release linked to shared/.env and shared/storage.');
+        }
 
         // Optional: grant CREATEDB to the DB user so stancl/tenancy can auto-create
         // tenant databases. Parses DB_USERNAME from the site's env_content.
@@ -724,7 +783,7 @@ class DeployService
         }
 
         $php = escapeshellarg($this->site->php_binary);
-        $path = escapeshellarg($this->site->deploy_path);
+        $path = escapeshellarg($this->targetPath());
         $token = bin2hex(random_bytes(16));
 
         // Run `down` + clear stale caches first.
@@ -736,7 +795,13 @@ class DeployService
         // loads that manifest and dies with "Class ... ServiceProvider not found"
         // before it can clear anything. Deleting the compiled files directly (no
         // framework boot) lets the app boot fresh and regenerate the manifest.
-        foreach ([
+        // Atomic deploys build a release the live site isn't serving yet, so
+        // there is nothing to take down — the old release keeps answering until
+        // the symlink flips. Sites with destructive migrations can opt back in
+        // via maintenance_on_migrate.
+        $useMaintenance = ! $this->site->isAtomic() || $this->site->maintenance_on_migrate;
+
+        $earlyCommands = [
             149 => "cd {$path} && rm -f bootstrap/cache/packages.php bootstrap/cache/services.php bootstrap/cache/config.php bootstrap/cache/events.php bootstrap/cache/routes-*.php 2>&1",
             // Install PHP dependencies on the server — vendor/ is excluded from the zip
             // to keep uploads small. composer must be in PATH on the remote server.
@@ -750,9 +815,15 @@ class DeployService
             // not found" boot crash that took the site down when the cache was cleared
             // but never rebuilt.
             147 => "cd {$path} && {$php} artisan package:discover --no-interaction 2>&1 || true",
-            15 => "cd {$path} && {$php} artisan down --retry=60 --secret={$token} 2>&1",
             150 => "cd {$path} && {$php} artisan optimize:clear 2>&1",
-        ] as $earlyStep => $earlyCmd) {
+        ];
+
+        if ($useMaintenance) {
+            $earlyCommands[15] = "cd {$path} && {$php} artisan down --retry=60 --secret={$token} 2>&1";
+            ksort($earlyCommands);
+        }
+
+        foreach ($earlyCommands as $earlyStep => $earlyCmd) {
             $earlyResult = $this->ssh->exec($earlyCmd);
             $earlyExit = $earlyResult['exit_code'] ?? 1;
             $this->log(4, $earlyStep, $earlyExit === 0 ? 'success' : 'error',
@@ -860,7 +931,16 @@ class DeployService
         $webUser = $this->webUser();
         if ($webUser) {
             $owner = escapeshellarg($webUser.':'.$webUser);
-            $commands[235] = $this->asRoot("chown -R {$owner} {$path}").' 2>/dev/null; true';
+
+            // On atomic sites $path is just this release, so chown it plus
+            // shared/ — never the whole deploy_path, which holds every retained
+            // release and would make each deploy slower than the last.
+            $chownTargets = $path;
+            if ($this->site->isAtomic()) {
+                $chownTargets .= ' '.escapeshellarg($this->site->sharedPath());
+            }
+
+            $commands[235] = $this->asRoot("chown -R {$owner} {$chownTargets}").' 2>/dev/null; true';
         }
 
         ksort($commands);
@@ -998,6 +1078,79 @@ class DeployService
         }
     }
 
+    private function atomic(): AtomicReleaseService
+    {
+        return $this->atomic ??= new AtomicReleaseService($this->ssh);
+    }
+
+    /**
+     * Phase 2 step 1: create the release directory and remember the current one.
+     */
+    private function beginAtomicRelease(): void
+    {
+        $atomic = $this->atomic();
+
+        $atomic->ensureLayout($this->site);
+
+        $previous = $atomic->currentRelease($this->site);
+        $this->releasePath = $this->site->releasePath($this->deployment->id);
+
+        $this->ssh->exec('mkdir -p '.escapeshellarg($this->releasePath));
+
+        $this->deployment->forceFill([
+            'release_path' => $this->releasePath,
+            'previous_release' => $previous,
+        ])->save();
+
+        $this->log(2, 27, 'info', null, sprintf(
+            'Atomic release %s prepared. Live site still serving %s.',
+            basename($this->releasePath),
+            $previous ? basename($previous) : '(none — first deploy)',
+        ));
+    }
+
+    /**
+     * Phase 2 steps 6–7: flip `current` to the new release, then reload PHP-FPM.
+     */
+    private function completeAtomicRelease(): void
+    {
+        $atomic = $this->atomic();
+
+        $atomic->switchTo($this->site, $this->releasePath);
+        $this->log(2, 28, 'success', null, sprintf(
+            'Switched current → %s (atomic symlink swap).', basename($this->releasePath)
+        ));
+
+        $reload = $atomic->reload($this->site);
+
+        if ($reload['skipped']) {
+            $this->log(2, 28, 'warning', null, $reload['output']);
+        } else {
+            $this->log(2, 28, ($reload['exit_code'] ?? 1) === 0 ? 'success' : 'warning',
+                $this->site->reload_command, $reload['output'], $reload['exit_code']);
+        }
+    }
+
+    /**
+     * Make it unambiguous in the log whether a failed atomic deploy affected
+     * the live site. Before the switch it cannot have.
+     */
+    private function reportAtomicFailureState(): void
+    {
+        if (! $this->site->isAtomic() || ! $this->releasePath) {
+            return;
+        }
+
+        $live = $this->atomic()->currentRelease($this->site);
+
+        if ($live !== $this->releasePath) {
+            $this->log(2, 27, 'info', null,
+                'Deploy failed before the atomic switch — the live site is unchanged and still '
+                .'serving '.($live ? basename($live) : 'its previous release').'. '
+                .'The failed release was left in place for inspection.');
+        }
+    }
+
     /**
      * Bring the site out of maintenance after a failed deploy.
      *
@@ -1020,7 +1173,7 @@ class DeployService
             $this->ssh->reconnect();
 
             $php = $this->site->php_binary ?: 'php';
-            $cmd = "cd {$this->site->deploy_path} && {$php} artisan up 2>&1";
+            $cmd = "cd {$this->targetPath()} && {$php} artisan up 2>&1";
 
             $result = $this->ssh->exec($cmd);
             $exit = $result['exit_code'] ?? 1;
@@ -1038,7 +1191,7 @@ class DeployService
 
     private function getRemoteErrorLog(): string
     {
-        $path = escapeshellarg($this->site->deploy_path.'/storage/logs/laravel.log');
+        $path = escapeshellarg($this->statePath().'/storage/logs/laravel.log');
         $result = $this->ssh->exec("tail -50 {$path} 2>/dev/null");
 
         return $result['output'] ?? '';

@@ -13,6 +13,7 @@ class Site extends Model
         'server_id', 'name', 'deploy_path', 'source_path', 'repo_url', 'branch', 'run_seeders', 'run_tenant_migrations', 'grant_createdb',
         'pre_migrate_commands', 'php_binary', 'app_url', 'env_content', 'active',
         'webhook_secret', 'environment',
+        'release_mode', 'keep_releases', 'maintenance_on_migrate', 'reload_command',
     ];
 
     protected $hidden = ['env_content', 'webhook_secret'];
@@ -22,6 +23,8 @@ class Site extends Model
         'run_seeders' => 'boolean',
         'run_tenant_migrations' => 'boolean',
         'grant_createdb' => 'boolean',
+        'maintenance_on_migrate' => 'boolean',
+        'keep_releases' => 'integer',
     ];
 
     public function setEnvContentAttribute(?string $value): void
@@ -71,6 +74,29 @@ class Site extends Model
     public function isProduction(): bool
     {
         return ($this->environment ?? 'production') === 'production';
+    }
+
+    /** Atomic sites deploy into releases/{id} and flip a `current` symlink. */
+    public function isAtomic(): bool
+    {
+        return ($this->release_mode ?? 'in_place') === 'atomic';
+    }
+
+    /** Absolute path of the shared (release-independent) directory. */
+    public function sharedPath(): string
+    {
+        return rtrim($this->deploy_path, '/').'/shared';
+    }
+
+    /** Absolute path of the `current` symlink that the web root points at. */
+    public function currentPath(): string
+    {
+        return rtrim($this->deploy_path, '/').'/current';
+    }
+
+    public function releasePath(int $deploymentId): string
+    {
+        return rtrim($this->deploy_path, '/')."/releases/{$deploymentId}";
     }
 
     public function server(): BelongsTo

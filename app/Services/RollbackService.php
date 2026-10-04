@@ -2,9 +2,8 @@
 
 namespace App\Services;
 
-use App\Models\Deployment;
 use App\Models\DeployLog;
-use RuntimeException;
+use App\Models\Deployment;
 
 class RollbackService
 {
@@ -24,51 +23,77 @@ class RollbackService
 
     public function rollback(Deployment $deployment, string $errorLog = ''): void
     {
-        $server      = $deployment->server;
-        $site        = $deployment->site;
-        $deployPath  = $site->deploy_path;
-        $snapshotDir = config('autopilot.deploy.snapshots_path')
-            . DIRECTORY_SEPARATOR . $deployment->id;
-
+        $server = $deployment->server;
+        $site = $deployment->site;
+        $deployPath = $site->deploy_path;
         DeployLog::record($deployment->id, 6, 28, 'info', null,
-            'Starting rollback for deployment #' . $deployment->id);
+            'Starting rollback for deployment #'.$deployment->id);
 
         if ($errorLog) {
             try {
                 $diagnosis = $this->claude->diagnoseError($errorLog, '');
                 DeployLog::record($deployment->id, 6, 28, 'info', null,
-                    'AI Diagnosis: ' . json_encode($diagnosis), null, $diagnosis);
+                    'AI Diagnosis: '.json_encode($diagnosis), null, $diagnosis);
             } catch (\Throwable $e) {
                 DeployLog::record($deployment->id, 6, 28, 'warning', null,
-                    'AI diagnosis unavailable: ' . $e->getMessage());
+                    'AI diagnosis unavailable: '.$e->getMessage());
             }
         }
 
-        // Restore snapshot
-        if (is_dir($snapshotDir)) {
-            $result = $this->ssh->exec(
-                'rsync -az --delete ' . escapeshellarg($snapshotDir . '/') . ' '
-                . escapeshellarg($deployPath . '/')
+        // Atomic sites roll back by pointing `current` at the previous release
+        // — instant, and it restores the exact code that was running before.
+        //
+        // The old path rsync'd a local snapshot directory into a REMOTE path,
+        // which could never work, and createSnapshot() was never called anyway,
+        // so $snapshotDir never existed (F4).
+        if ($site->isAtomic() && $deployment->previous_release) {
+            $atomic = new AtomicReleaseService($this->ssh);
+
+            $exists = $this->ssh->exec(
+                '[ -d '.escapeshellarg($deployment->previous_release).' ] && echo yes || echo no'
             );
-            DeployLog::record($deployment->id, 6, 29, $result['exit_code'] === 0 ? 'success' : 'error',
-                'rsync snapshot restore', $result['output'], $result['exit_code']);
+
+            if (trim($exists['output'] ?? '') === 'yes') {
+                $atomic->switchTo($site, $deployment->previous_release);
+                $reload = $atomic->reload($site);
+
+                DeployLog::record($deployment->id, 6, 29, 'success', null,
+                    'Rolled back: current → '.basename($deployment->previous_release)
+                    .($reload['skipped'] ? ' (no reload_command set)' : ' and PHP-FPM reloaded'));
+            } else {
+                DeployLog::record($deployment->id, 6, 29, 'error', null,
+                    'Cannot roll back — previous release '.$deployment->previous_release
+                    .' no longer exists on the server (pruned?). The failed release is still live.');
+            }
+        } elseif ($site->isAtomic()) {
+            DeployLog::record($deployment->id, 6, 29, 'warning', null,
+                'No previous release recorded (first deploy) — nothing to roll back to.');
+        } else {
+            DeployLog::record($deployment->id, 6, 29, 'warning', null,
+                'Site is in in_place mode, so there is no previous release to restore. '
+                .'Convert it with `php artisan deploy:convert-atomic` to get real rollbacks.');
         }
 
-        // Rollback migrations if they ran
+        // Migrations are NOT rolled back automatically (Phase 2). Running
+        // migrate:rollback against a schema the restored code may not expect is
+        // how one bad deploy becomes two — and `down()` methods are frequently
+        // untested. Surface it and let a human decide.
         $migrationsRan = $deployment->logs()
             ->where('phase', 4)
             ->where('step', 16)
             ->where('status', 'success')
             ->exists();
 
-        $php  = escapeshellarg($site->php_binary ?: 'php');
-        $path = escapeshellarg($deployPath);
-
         if ($migrationsRan) {
-            $result = $this->ssh->exec("cd {$path} && {$php} artisan migrate:rollback --force 2>&1");
-            DeployLog::record($deployment->id, 6, 30, $result['exit_code'] === 0 ? 'success' : 'warning',
-                'php artisan migrate:rollback --force', $result['output'], $result['exit_code']);
+            DeployLog::record($deployment->id, 6, 30, 'warning', null,
+                'This deploy ran migrations. The code was rolled back but the DATABASE SCHEMA '
+                .'was NOT — the restored release is running against the new schema. If that '
+                .'breaks it, roll the migration back manually. Additive (expand/contract) '
+                .'migrations avoid this entirely.');
         }
+
+        $php = escapeshellarg($site->php_binary ?: 'php');
+        $path = escapeshellarg($deployment->previous_release ?: $deployPath);
 
         // Bring app back up
         $result = $this->ssh->exec("cd {$path} && {$php} artisan up 2>&1");
@@ -78,24 +103,24 @@ class RollbackService
         $deployment->markFinished('rolled_back');
     }
 
-    public function createSnapshot(Deployment $deployment): void
+    /**
+     * Rolling back no longer rolls migrations back automatically.
+     *
+     * A symlink swap restores the previous CODE instantly, but `migrate:rollback`
+     * on a schema the old code may not match is how one bad deploy becomes two.
+     * The UI warns when the rolled-back deploy ran migrations; prefer additive
+     * (expand/contract) migrations so the old release keeps working against the
+     * new schema.
+     */
+    public function rollbackMigrations(Deployment $deployment): void
     {
-        $deployPath  = $deployment->site->deploy_path;
-        $snapshotDir = config('autopilot.deploy.snapshots_path')
-            . DIRECTORY_SEPARATOR . $deployment->id;
+        $site = $deployment->site;
+        $php = escapeshellarg($site->php_binary ?: 'php');
+        $path = escapeshellarg($deployment->previous_release ?: $site->deploy_path);
 
-        if (!is_dir($snapshotDir)) {
-            mkdir($snapshotDir, 0755, true);
-        }
+        $result = $this->ssh->exec("cd {$path} && {$php} artisan migrate:rollback --force 2>&1");
 
-        $result = $this->ssh->exec(
-            'rsync -az --exclude=.git --exclude=node_modules ' .
-            escapeshellarg($deployPath . '/') . ' ' .
-            escapeshellarg($snapshotDir . '/')
-        );
-
-        if ($result['exit_code'] !== 0) {
-            throw new RuntimeException('Snapshot creation failed: ' . $result['output']);
-        }
+        DeployLog::record($deployment->id, 6, 30, $result['exit_code'] === 0 ? 'success' : 'error',
+            'php artisan migrate:rollback --force', $result['output'], $result['exit_code']);
     }
 }

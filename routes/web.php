@@ -48,6 +48,8 @@ Route::middleware('auth')->group(function () {
     Route::get('/deployments/{deployment}', [DeployController::class, 'show'])->name('deployments.show');
     Route::get('/deployments/{deployment}/poll', [DeployController::class, 'poll'])->name('deployments.poll');
     Route::get('/deployments/{deployment}/logs', [LogController::class, 'forDeployment'])->name('deployments.logs');
+    // Phase 2: manual rollback — swaps `current` back to this deployment's release.
+    Route::post('/deployments/{deployment}/rollback', [DeployController::class, 'rollback'])->name('deployments.rollback');
 
     // Logs
     Route::get('/logs', [LogController::class, 'index'])->name('logs.index');
