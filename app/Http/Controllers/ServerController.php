@@ -15,13 +15,14 @@ class ServerController extends Controller
     private function serversQuery()
     {
         $user = auth()->user();
+
         return $user->isAdmin() ? Server::query() : Server::where('user_id', $user->id);
     }
 
     private function authorizeServer(Server $server): void
     {
         $user = auth()->user();
-        if (!$user->isAdmin() && $server->user_id !== $user->id) {
+        if (! $user->isAdmin() && $server->user_id !== $user->id) {
             abort(403);
         }
     }
@@ -44,18 +45,18 @@ class ServerController extends Controller
     public function store(Request $request): RedirectResponse
     {
         $data = $request->validate([
-            'name'            => 'required|string|max:100',
-            'panel_type'      => 'required|in:cpanel,aapanel,openpanel',
-            'host'            => 'required|string|max:255',
-            'ssh_port'        => 'integer|min:1|max:65535',
-            'ssh_user'        => 'required|string|max:100',
-            'web_user'        => 'nullable|string|max:100',
-            'ssh_auth'        => 'required|in:password,key',
-            'ssh_password'    => 'nullable|string',
+            'name' => 'required|string|max:100',
+            'panel_type' => 'required|in:cpanel,aapanel,openpanel',
+            'host' => 'required|string|max:255',
+            'ssh_port' => 'integer|min:1|max:65535',
+            'ssh_user' => 'required|string|max:100',
+            'web_user' => 'nullable|string|max:100',
+            'ssh_auth' => 'required|in:password,key',
+            'ssh_password' => 'nullable|string',
             'ssh_private_key' => 'nullable|string',
-            'panel_url'       => 'nullable|url',
-            'panel_token'     => 'nullable|string',
-            'active'          => 'boolean',
+            'panel_url' => 'nullable|url',
+            'panel_token' => 'nullable|string',
+            'active' => 'boolean',
         ]);
 
         $data['user_id'] = auth()->id();
@@ -69,7 +70,7 @@ class ServerController extends Controller
         $this->authorizeServer($server);
         $server->load([
             'sites',
-            'sites.deployments' => fn($q) => $q->latest()->limit(1),
+            'sites.deployments' => fn ($q) => $q->latest()->limit(1),
         ]);
 
         return Inertia::render('Servers/Show', [
@@ -86,9 +87,9 @@ class ServerController extends Controller
         // explicitly here so the edit form can pre-fill — same pattern as
         // SiteController + env_content (CLAUDE.md rule 12).
         $payload = array_merge($server->toArray(), [
-            'ssh_password'    => $server->ssh_password,
+            'ssh_password' => $server->ssh_password,
             'ssh_private_key' => $server->ssh_private_key,
-            'panel_token'     => $server->panel_token,
+            'panel_token' => $server->panel_token,
         ]);
 
         return Inertia::render('Servers/Edit', ['server' => $payload]);
@@ -98,18 +99,18 @@ class ServerController extends Controller
     {
         $this->authorizeServer($server);
         $data = $request->validate([
-            'name'            => 'required|string|max:100',
-            'panel_type'      => 'required|in:cpanel,aapanel,openpanel',
-            'host'            => 'required|string|max:255',
-            'ssh_port'        => 'integer|min:1|max:65535',
-            'ssh_user'        => 'required|string|max:100',
-            'web_user'        => 'nullable|string|max:100',
-            'ssh_auth'        => 'required|in:password,key',
-            'ssh_password'    => 'nullable|string',
+            'name' => 'required|string|max:100',
+            'panel_type' => 'required|in:cpanel,aapanel,openpanel',
+            'host' => 'required|string|max:255',
+            'ssh_port' => 'integer|min:1|max:65535',
+            'ssh_user' => 'required|string|max:100',
+            'web_user' => 'nullable|string|max:100',
+            'ssh_auth' => 'required|in:password,key',
+            'ssh_password' => 'nullable|string',
             'ssh_private_key' => 'nullable|string',
-            'panel_url'       => 'nullable|url',
-            'panel_token'     => 'nullable|string',
-            'active'          => 'boolean',
+            'panel_url' => 'nullable|url',
+            'panel_token' => 'nullable|string',
+            'active' => 'boolean',
         ]);
 
         foreach (['ssh_password', 'ssh_private_key', 'panel_token'] as $field) {
@@ -133,13 +134,13 @@ class ServerController extends Controller
 
     public function testConnection(Server $server): JsonResponse
     {
-        $ssh    = new SshService($server);
+        $ssh = new SshService($server);
         $result = $ssh->testConnectionDetailed();
 
         return response()->json([
             'connected' => $result['ok'],
-            'message'   => $result['message'],
-            'reason'    => $result['reason'] ?? null,
+            'message' => $result['message'],
+            'reason' => $result['reason'] ?? null,
         ]);
     }
 }

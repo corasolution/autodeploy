@@ -41,6 +41,9 @@ Route::middleware('auth')->group(function () {
     Route::get('/sites/{site}/edit', [SiteController::class, 'edit'])->name('sites.edit');
     Route::put('/sites/{site}', [SiteController::class, 'update'])->name('sites.update');
     Route::delete('/sites/{site}', [SiteController::class, 'destroy'])->name('sites.destroy');
+    // Phase 5: generate/rotate the webhook secret. The plaintext secret is
+    // returned by this call only — it is encrypted at rest and never re-shown.
+    Route::post('/sites/{site}/webhook-secret', [SiteController::class, 'rotateWebhookSecret'])->name('sites.webhook-secret');
 
     // Deployments
     Route::post('/deploy', [DeployController::class, 'trigger'])->name('deploy.trigger');

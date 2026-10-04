@@ -9,26 +9,27 @@ use RuntimeException;
 class CpanelApiService
 {
     private Server $server;
+
     private string $baseUrl;
 
     public function __construct(Server $server)
     {
-        $this->server  = $server;
-        $port          = config('autopilot.cpanel.default_port', 2083);
+        $this->server = $server;
+        $port = config('autopilot.cpanel.default_port', 2083);
         $this->baseUrl = rtrim($server->panel_url ?? "https://{$server->host}:{$port}", '/');
     }
 
     public function uapi(string $module, string $function, array $params = []): array
     {
         $path = config('autopilot.cpanel.uapi_path', '/execute/');
-        $url  = "{$this->baseUrl}{$path}{$module}/{$function}";
+        $url = "{$this->baseUrl}{$path}{$module}/{$function}";
 
         $response = Http::withHeaders([
-            'Authorization' => 'cpanel ' . $this->server->ssh_user . ':' . $this->server->panel_token,
+            'Authorization' => 'cpanel '.$this->server->ssh_user.':'.$this->server->panel_token,
         ])->get($url, $params);
 
-        if (!$response->successful()) {
-            throw new RuntimeException("cPanel UAPI error [{$module}/{$function}]: " . $response->body());
+        if (! $response->successful()) {
+            throw new RuntimeException("cPanel UAPI error [{$module}/{$function}]: ".$response->body());
         }
 
         $data = $response->json();
@@ -49,7 +50,7 @@ class CpanelApiService
     public function checkDatabaseExists(string $dbName): bool
     {
         $databases = $this->uapi('MysqlFE', 'list_databases');
-        $names     = array_column($databases, 'database');
+        $names = array_column($databases, 'database');
 
         return in_array($dbName, $names, true);
     }

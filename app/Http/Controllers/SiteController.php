@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Server;
 use App\Models\Site;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\ValidationException;
@@ -12,6 +13,70 @@ use Inertia\Response;
 
 class SiteController extends Controller
 {
+    /**
+     * UPGRADE-v2 Phase 5 — webhook tab.
+     *
+     * Rotates (or creates) the site's webhook secret and returns it together
+     * with a ready-to-paste GitHub Actions workflow.
+     *
+     * The secret is returned EXACTLY ONCE, here, at the moment it is generated.
+     * It is encrypted at rest and `$hidden` on the model, so it is never
+     * serialised into any other response.
+     */
+    public function rotateWebhookSecret(Site $site): JsonResponse
+    {
+        $this->authorizeServer($site->server);
+
+        $secret = 'whsec_'.bin2hex(random_bytes(24));
+
+        $site->update(['webhook_secret' => $secret]);
+
+        return response()->json([
+            'secret' => $secret,
+            'url' => rtrim(config('app.url'), '/').'/api/webhooks/deploy',
+            'site' => $site->name,
+            'workflow' => $this->githubWorkflow($site),
+        ]);
+    }
+
+    /**
+     * The deploy step signs the exact bytes it posts — `printf '%s'` rather
+     * than echo, which would append a newline and break the HMAC.
+     */
+    private function githubWorkflow(Site $site): string
+    {
+        $branch = $site->branch ?: 'main';
+
+        return <<<YAML
+        name: Test & Deploy
+        on: { push: { branches: [{$branch}] } }
+
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@v4
+              - uses: shivammathur/setup-php@v2
+                with: { php-version: '8.3' }
+              - run: composer install --no-interaction
+              - run: cp .env.example .env && php artisan key:generate
+              - run: php artisan test
+
+          deploy:
+            needs: test
+            runs-on: ubuntu-latest
+            steps:
+              - name: Trigger AutoPilot
+                run: |
+                  BODY='{"site":"\${{ vars.AUTOPILOT_SITE }}","branch":"{$branch}","commit":"\${{ github.sha }}"}'
+                  SIG=\$(printf '%s' "\$BODY" | openssl dgst -sha256 -hmac "\${{ secrets.AUTOPILOT_SECRET }}" | sed 's/^.* //')
+                  curl -fsS -X POST "\${{ vars.AUTOPILOT_URL }}/api/webhooks/deploy" \\
+                    -H "Content-Type: application/json" \\
+                    -H "X-Signature: sha256=\$SIG" \\
+                    -d "\$BODY"
+        YAML;
+    }
+
     private function authorizeServer(Server $server): void
     {
         $user = auth()->user();

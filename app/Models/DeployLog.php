@@ -16,10 +16,10 @@ class DeployLog extends Model
 
     protected $casts = [
         'ai_diagnosis' => 'array',
-        'logged_at'    => 'datetime',
-        'phase'        => 'integer',
-        'step'         => 'integer',
-        'exit_code'    => 'integer',
+        'logged_at' => 'datetime',
+        'phase' => 'integer',
+        'step' => 'integer',
+        'exit_code' => 'integer',
     ];
 
     public function deployment(): BelongsTo
@@ -39,14 +39,14 @@ class DeployLog extends Model
     ): self {
         return self::create([
             'deployment_id' => $deploymentId,
-            'phase'         => $phase,
-            'step'          => $step,
-            'status'        => $status,
-            'command'       => $command,
-            'output'        => $output,
-            'exit_code'     => $exitCode,
-            'ai_diagnosis'  => $aiDiagnosis,
-            'logged_at'     => now(),
+            'phase' => $phase,
+            'step' => $step,
+            'status' => $status,
+            'command' => $command,
+            'output' => $output,
+            'exit_code' => $exitCode,
+            'ai_diagnosis' => $aiDiagnosis,
+            'logged_at' => now(),
         ]);
     }
 }

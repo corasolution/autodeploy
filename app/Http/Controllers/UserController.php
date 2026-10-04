@@ -31,17 +31,17 @@ class UserController extends Controller
         $this->requireAdmin();
 
         $data = $request->validate([
-            'name'     => 'required|string|max:100',
-            'email'    => 'required|email|unique:users,email',
+            'name' => 'required|string|max:100',
+            'email' => 'required|email|unique:users,email',
             'password' => 'required|string|min:8',
-            'role'     => 'required|in:admin,user',
+            'role' => 'required|in:admin,user',
         ]);
 
         User::create([
-            'name'     => $data['name'],
-            'email'    => $data['email'],
+            'name' => $data['name'],
+            'email' => $data['email'],
             'password' => Hash::make($data['password']),
-            'role'     => $data['role'],
+            'role' => $data['role'],
         ]);
 
         return back()->with('success', 'User created.');
@@ -52,17 +52,17 @@ class UserController extends Controller
         $this->requireAdmin();
 
         $data = $request->validate([
-            'name'     => 'required|string|max:100',
-            'email'    => ['required', 'email', Rule::unique('users', 'email')->ignore($user->id)],
-            'role'     => 'required|in:admin,user',
+            'name' => 'required|string|max:100',
+            'email' => ['required', 'email', Rule::unique('users', 'email')->ignore($user->id)],
+            'role' => 'required|in:admin,user',
             'password' => 'nullable|string|min:8',
         ]);
 
-        $user->name  = $data['name'];
+        $user->name = $data['name'];
         $user->email = $data['email'];
-        $user->role  = $data['role'];
+        $user->role = $data['role'];
 
-        if (!empty($data['password'])) {
+        if (! empty($data['password'])) {
             $user->password = Hash::make($data['password']);
         }
 
@@ -86,7 +86,7 @@ class UserController extends Controller
 
     private function requireAdmin(): void
     {
-        if (!auth()->user()->isAdmin()) {
+        if (! auth()->user()->isAdmin()) {
             abort(403);
         }
     }

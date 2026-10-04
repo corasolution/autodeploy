@@ -24,6 +24,13 @@ return [
         'approval_required_levels' => ['high'],
     ],
 
+    'telegram' => [
+        // The bot belongs to this AutoPilot install; the chat is per-server
+        // (servers.telegram_chat_id) with this as the fallback.
+        'bot_token' => env('TELEGRAM_BOT_TOKEN'),
+        'default_chat_id' => env('TELEGRAM_CHAT_ID'),
+    ],
+
     'cpanel' => [
         'default_port' => 2083,
         'uapi_path' => '/execute/',

@@ -21,7 +21,7 @@ class DeploymentPhaseCompleted implements ShouldBroadcast
 
     public function broadcastOn(): array
     {
-        return [new Channel('deployments.' . $this->deployment->id)];
+        return [new Channel('deployments.'.$this->deployment->id)];
     }
 
     public function broadcastAs(): string
@@ -33,9 +33,9 @@ class DeploymentPhaseCompleted implements ShouldBroadcast
     {
         return [
             'deployment_id' => $this->deployment->id,
-            'phase'         => $this->phase,
-            'message'       => $this->message,
-            'status'        => $this->deployment->status,
+            'phase' => $this->phase,
+            'message' => $this->message,
+            'status' => $this->deployment->status,
         ];
     }
 }

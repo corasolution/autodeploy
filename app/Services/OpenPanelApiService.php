@@ -24,13 +24,15 @@ use RuntimeException;
 class OpenPanelApiService
 {
     private Server $server;
+
     private string $baseUrl;
+
     private ?string $jwt = null;
 
     public function __construct(Server $server)
     {
-        $this->server  = $server;
-        $port          = config('autopilot.openpanel.default_admin_port', 2087);
+        $this->server = $server;
+        $port = config('autopilot.openpanel.default_admin_port', 2087);
         $this->baseUrl = rtrim($server->panel_url ?? "http://{$server->host}:{$port}", '/');
     }
 
@@ -45,22 +47,22 @@ class OpenPanelApiService
 
         $response = Http::withoutVerifying()
             ->acceptJson()
-            ->post($this->baseUrl . $path, [
+            ->post($this->baseUrl.$path, [
                 'username' => $this->server->ssh_user,
                 'password' => $this->server->panel_token,
             ]);
 
         if (! $response->successful()) {
-            throw new RuntimeException('OpenPanel login failed: ' . $response->body());
+            throw new RuntimeException('OpenPanel login failed: '.$response->body());
         }
 
         // The field name has varied across releases; accept the common spellings
         // rather than hard-failing on a rename.
         $result = $response->json();
-        $token  = $result['access_token'] ?? $result['token'] ?? $result['jwt'] ?? null;
+        $token = $result['access_token'] ?? $result['token'] ?? $result['jwt'] ?? null;
 
         if (! is_string($token) || $token === '') {
-            throw new RuntimeException('OpenPanel login returned no token: ' . $response->body());
+            throw new RuntimeException('OpenPanel login returned no token: '.$response->body());
         }
 
         return $this->jwt = $token;
@@ -76,10 +78,10 @@ class OpenPanelApiService
         $response = Http::withoutVerifying()
             ->acceptJson()
             ->withToken($this->login())
-            ->{$method}($this->baseUrl . '/' . ltrim($path, '/'), $data);
+            ->{$method}($this->baseUrl.'/'.ltrim($path, '/'), $data);
 
         if (! $response->successful()) {
-            throw new RuntimeException("OpenPanel API error [{$path}]: " . $response->body());
+            throw new RuntimeException("OpenPanel API error [{$path}]: ".$response->body());
         }
 
         return $response->json() ?? [];

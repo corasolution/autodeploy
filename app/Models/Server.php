@@ -2,11 +2,10 @@
 
 namespace App\Models;
 
+use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
-use Illuminate\Contracts\Encryption\DecryptException;
-use Illuminate\Support\Facades\Crypt;
 
 class Server extends Model
 {
@@ -30,13 +29,13 @@ class Server extends Model
     protected $fillable = [
         'user_id', 'name', 'panel_type', 'host', 'ssh_port', 'ssh_user', 'web_user',
         'ssh_auth', 'ssh_password', 'ssh_private_key',
-        'panel_url', 'panel_token', 'webhook_secret', 'active',
+        'panel_url', 'panel_token', 'webhook_secret', 'active', 'telegram_chat_id',
     ];
 
     protected $hidden = ['ssh_password', 'ssh_private_key', 'panel_token', 'webhook_secret'];
 
     protected $casts = [
-        'active'   => 'boolean',
+        'active' => 'boolean',
         'ssh_port' => 'integer',
     ];
 

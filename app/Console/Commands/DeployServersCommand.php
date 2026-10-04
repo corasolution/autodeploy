@@ -7,7 +7,8 @@ use Illuminate\Console\Command;
 
 class DeployServersCommand extends Command
 {
-    protected $signature   = 'deploy:servers';
+    protected $signature = 'deploy:servers';
+
     protected $description = 'List all registered server profiles';
 
     public function handle(): int
@@ -16,12 +17,13 @@ class DeployServersCommand extends Command
 
         if ($servers->isEmpty()) {
             $this->warn('No servers registered.');
+
             return self::SUCCESS;
         }
 
         $this->table(
             ['ID', 'Name', 'Panel', 'Host', 'SSH User', 'Active'],
-            $servers->map(fn($s) => [
+            $servers->map(fn ($s) => [
                 $s->id, $s->name, $s->panel_type, $s->host, $s->ssh_user, $s->active ? 'yes' : 'no',
             ])
         );

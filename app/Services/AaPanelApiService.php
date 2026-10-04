@@ -9,23 +9,24 @@ use RuntimeException;
 class AaPanelApiService
 {
     private Server $server;
+
     private string $baseUrl;
 
     public function __construct(Server $server)
     {
         $this->server = $server;
-        $port         = config('autopilot.aapanel.default_port_http', 7800);
+        $port = config('autopilot.aapanel.default_port_http', 7800);
         $this->baseUrl = rtrim($server->panel_url ?? "http://{$server->host}:{$port}", '/');
     }
 
     private function sign(string $path): array
     {
-        $time       = time();
-        $token      = $this->server->panel_token;
-        $requestToken = md5(md5((string) $time) . $token);
+        $time = time();
+        $token = $this->server->panel_token;
+        $requestToken = md5(md5((string) $time).$token);
 
         return [
-            'request_time'  => $time,
+            'request_time' => $time,
             'request_token' => $requestToken,
         ];
     }
@@ -33,20 +34,20 @@ class AaPanelApiService
     public function request(string $path, array $data = []): array
     {
         $payload = array_merge($data, $this->sign($path));
-        $url     = $this->baseUrl . $path;
+        $url = $this->baseUrl.$path;
 
         $response = Http::asForm()
             ->withoutVerifying()
             ->post($url, $payload);
 
-        if (!$response->successful()) {
-            throw new RuntimeException("aaPanel API error [{$path}]: " . $response->body());
+        if (! $response->successful()) {
+            throw new RuntimeException("aaPanel API error [{$path}]: ".$response->body());
         }
 
         $result = $response->json();
 
         if (isset($result['status']) && $result['status'] === false) {
-            throw new RuntimeException("aaPanel API failed [{$path}]: " . ($result['msg'] ?? 'Unknown error'));
+            throw new RuntimeException("aaPanel API failed [{$path}]: ".($result['msg'] ?? 'Unknown error'));
         }
 
         return $result;
