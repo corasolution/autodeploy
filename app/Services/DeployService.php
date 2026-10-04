@@ -3,22 +3,78 @@
 namespace App\Services;
 
 use App\Events\DeploymentPhaseCompleted;
-use App\Models\Deployment;
 use App\Models\DeployLog;
+use App\Models\Deployment;
 use App\Models\Server;
 use App\Models\Site;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Process;
 use RuntimeException;
 
 class DeployService
 {
     private SshService $ssh;
+
     private ClaudeAgentService $claude;
+
     private RollbackService $rollback;
+
     private Deployment $deployment;
+
     private Server $server;
+
     private Site $site;
+
     private ?string $gitTempPath = null;
+
+    /**
+     * True once `artisan down` has run and `artisan up` has not yet.
+     *
+     * Phase 4 puts the site into maintenance at step 15 and only lifts it at
+     * step 23. Any throw in between (a failing migration is the common one)
+     * used to skip step 23 entirely and leave the site showing the 503 page
+     * until someone SSH'd in by hand. run()'s catch block uses this flag to
+     * guarantee the site comes back up even when the deploy fails.
+     */
+    private bool $maintenanceOn = false;
+
+    /**
+     * Run a local build command and fail loudly if it fails.
+     *
+     * shell_exec() returns only stdout and discards the exit code, so a failed
+     * `npm run build` or `composer install` used to be logged as success and
+     * shipped a broken (or stale) build to production. Process gives us the
+     * exit status, so a build failure now stops the deploy before upload.
+     */
+    private function runLocal(
+        int $step,
+        string $label,
+        string $command,
+        ?string $workingDir = null,
+        int $timeout = 1800,
+    ): string {
+        $pending = Process::timeout($timeout);
+
+        if ($workingDir !== null) {
+            $pending = $pending->path($workingDir);
+        }
+
+        $result = $pending->run($command);
+        $output = trim($result->output()."\n".$result->errorOutput());
+        $exit = $result->exitCode();
+
+        if ($result->failed()) {
+            $this->log(2, $step, 'error', $label, $output, $exit);
+
+            throw new RuntimeException(
+                "Local build step failed (exit {$exit}): {$label}\n".$output
+            );
+        }
+
+        $this->log(2, $step, 'success', $label, $output, $exit);
+
+        return $output;
+    }
 
     /**
      * Resolve the local composer command. On Windows (Laragon) `composer` may
@@ -27,9 +83,10 @@ class DeployService
      */
     private function getComposerCommand(): string
     {
-        // Check if composer is directly callable
-        $check = shell_exec('composer --version 2>&1');
-        if ($check && str_contains($check, 'Composer version')) {
+        // Probe only — a non-zero exit here is an expected outcome (composer
+        // not on PATH), not a deploy failure, so this one stays unchecked.
+        $check = Process::timeout(30)->run('composer --version');
+        if ($check->successful() && str_contains($check->output(), 'Composer version')) {
             return 'composer';
         }
 
@@ -40,7 +97,7 @@ class DeployService
         ];
         foreach ($pharPaths as $phar) {
             if (file_exists($phar)) {
-                return escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($phar);
+                return escapeshellarg(PHP_BINARY).' '.escapeshellarg($phar);
             }
         }
 
@@ -52,16 +109,16 @@ class DeployService
         ClaudeAgentService $claude,
         RollbackService $rollback
     ) {
-        $this->claude   = $claude;
+        $this->claude = $claude;
         $this->rollback = $rollback;
     }
 
     public function run(Deployment $deployment): void
     {
         $this->deployment = $deployment;
-        $this->site       = $deployment->site;
-        $this->server     = $deployment->server ?? $this->site->server;
-        $this->ssh        = new SshService($this->server);
+        $this->site = $deployment->site;
+        $this->server = $deployment->server ?? $this->site->server;
+        $this->ssh = new SshService($this->server);
 
         $deployment->markStarted();
 
@@ -80,7 +137,7 @@ class DeployService
                 $this->phase3Upload();
             } else {
                 $this->log(2, 7, 'info', null,
-                    'Phase 2 & 3 skipped — no source_path or repo_url set. ' .
+                    'Phase 2 & 3 skipped — no source_path or repo_url set. '.
                     'Running remote commands only on existing server code.');
             }
 
@@ -88,7 +145,7 @@ class DeployService
 
             $healthy = $this->phase5HealthCheck();
 
-            if (!$healthy) {
+            if (! $healthy) {
                 $lastErrorLog = $this->getRemoteErrorLog();
                 $this->phase6Rollback($lastErrorLog);
             } else {
@@ -96,6 +153,7 @@ class DeployService
             }
         } catch (\Throwable $e) {
             $this->log(0, 0, 'error', null, $e->getMessage());
+            $this->liftMaintenance();
             $deployment->markFinished('failed');
             throw $e;
         } finally {
@@ -135,18 +193,18 @@ class DeployService
 
         // Step 2: Test SSH
         $this->ssh->connect();
-        $this->log(1, 2, 'success', null, 'SSH connected to ' . $this->server->host);
+        $this->log(1, 2, 'success', null, 'SSH connected to '.$this->server->host);
 
         // Step 3: Check disk space
         $freeMb = $this->ssh->getDiskFreeSpace($this->site->deploy_path);
-        $minMb  = config('autopilot.deploy.disk_warning_mb', 500);
+        $minMb = config('autopilot.deploy.disk_warning_mb', 500);
         $status = $freeMb >= $minMb ? 'success' : 'warning';
         $this->log(1, 3, $status, null, "Disk free: {$freeMb}MB (minimum {$minMb}MB)");
 
         // Step 4: Check PHP version
         $phpVersion = $this->ssh->getPhpVersion();
-        $minPhp     = config('autopilot.deploy.min_php_version', '8.2');
-        $phpOk      = version_compare($phpVersion, $minPhp, '>=');
+        $minPhp = config('autopilot.deploy.min_php_version', '8.2');
+        $phpOk = version_compare($phpVersion, $minPhp, '>=');
         $this->log(1, 4, $phpOk ? 'success' : 'warning', null, "PHP: {$phpVersion}");
 
         // Step 5: Check MySQL
@@ -155,7 +213,7 @@ class DeployService
             'mysql --version', $result['output']);
 
         // Step 6: Snapshot current state
-        $result = $this->ssh->exec('cd ' . escapeshellarg($this->site->deploy_path) . ' && git rev-parse HEAD 2>/dev/null || echo "no-git"');
+        $result = $this->ssh->exec('cd '.escapeshellarg($this->site->deploy_path).' && git rev-parse HEAD 2>/dev/null || echo "no-git"');
         $this->log(1, 6, 'info', 'git rev-parse HEAD', trim($result['output']));
 
         $this->broadcastPhase(1, 'Pre-flight complete');
@@ -167,11 +225,11 @@ class DeployService
         $this->log(2, 7, 'info', null, 'Phase 2: Building assets locally');
 
         $base = $this->getSourcePath();
-        $this->log(2, 7, 'info', null, 'Building from source: ' . $base);
+        $this->log(2, 7, 'info', null, 'Building from source: '.$base);
 
-        // Step 7: npm run build
-        $output = shell_exec("cd " . escapeshellarg($base) . " && npm run build 2>&1");
-        $this->log(2, 7, 'success', 'npm run build', $output);
+        // Step 7: npm run build — throws on non-zero exit, so a broken build
+        // never reaches phase 3.
+        $this->runLocal(7, 'npm run build', 'npm run build', $base);
 
         // Step 8: vendor/ is excluded from the zip and installed on the server
         // in Phase 4 (composer install --no-dev). Skip local composer install
@@ -179,11 +237,11 @@ class DeployService
         $this->log(2, 8, 'success', null, 'Skipping local composer install — vendor/ installed on server in Phase 4.');
 
         // Step 9: Verify build output (only if project has a public/build/ target)
-        $buildPath = $base . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR . 'build';
+        $buildPath = $base.DIRECTORY_SEPARATOR.'public'.DIRECTORY_SEPARATOR.'build';
         if (is_dir($buildPath) && count(scandir($buildPath)) > 2) {
-            $this->log(2, 9, 'success', null, 'Build assets verified at ' . $buildPath);
+            $this->log(2, 9, 'success', null, 'Build assets verified at '.$buildPath);
         } else {
-            $this->log(2, 9, 'warning', null, 'No Vite build output found at ' . $buildPath . ' — continuing anyway');
+            $this->log(2, 9, 'warning', null, 'No Vite build output found at '.$buildPath.' — continuing anyway');
         }
 
         $this->broadcastPhase(2, 'Assets built');
@@ -194,15 +252,15 @@ class DeployService
     {
         $this->log(2, 7, 'info', null, 'Phase 2: Cloning repo and building assets');
 
-        // Verify git is available
-        $gitVersion = shell_exec('git --version 2>&1');
-        if (!$gitVersion || !str_contains($gitVersion, 'git version')) {
+        // Verify git is available (probe — handled explicitly below)
+        $gitVersion = Process::timeout(30)->run('git --version');
+        if (! $gitVersion->successful() || ! str_contains($gitVersion->output(), 'git version')) {
             throw new RuntimeException('git is not installed on this machine. Install git to use repo-based deploys.');
         }
 
-        $branch  = $this->site->branch ?: 'main';
+        $branch = $this->site->branch ?: 'main';
         $repoUrl = $this->site->repo_url;
-        $tempDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'autopilot_git_' . $this->deployment->id;
+        $tempDir = sys_get_temp_dir().DIRECTORY_SEPARATOR.'autopilot_git_'.$this->deployment->id;
 
         // Clean up any stale temp from a previous failed run
         if (is_dir($tempDir)) {
@@ -212,33 +270,34 @@ class DeployService
 
         // Clone (shallow — faster, less disk)
         $cloneCmd = sprintf(
-            'git clone --depth 1 --branch %s %s %s 2>&1',
+            'git clone --depth 1 --branch %s %s %s',
             escapeshellarg($branch),
             escapeshellarg($repoUrl),
             escapeshellarg($tempDir)
         );
-        $output = shell_exec($cloneCmd);
-        $this->log(2, 7, 'success', $cloneCmd, $output);
+        // A failed clone (bad branch, auth) used to fall through to the .git
+        // check below with the real git error discarded; now it surfaces.
+        $this->runLocal(7, $cloneCmd, $cloneCmd);
 
-        if (!is_dir($tempDir . DIRECTORY_SEPARATOR . '.git')) {
+        if (! is_dir($tempDir.DIRECTORY_SEPARATOR.'.git')) {
             throw new RuntimeException("Git clone failed — .git directory not found in {$tempDir}");
         }
 
         $this->gitTempPath = $tempDir;
 
         // npm install + build (cloned repo has no node_modules)
-        $output = shell_exec('cd ' . escapeshellarg($tempDir) . ' && npm install && npm run build 2>&1');
-        $this->log(2, 7, 'success', 'npm install && npm run build', $output);
+        $this->runLocal(7, 'npm install && npm run build', 'npm install && npm run build', $tempDir);
 
         // composer install (--no-scripts to avoid artisan package:discover DB errors)
         $composerCmd = $this->getComposerCommand();
-        $output = shell_exec('cd ' . escapeshellarg($tempDir) . " && {$composerCmd} install --no-dev --no-scripts --optimize-autoloader --ignore-platform-req=ext-pcntl --ignore-platform-req=ext-posix 2>&1");
-        $this->log(2, 8, 'success', 'composer install --no-dev --no-scripts --optimize-autoloader --ignore-platform-req=ext-pcntl', $output);
+        $composerArgs = 'install --no-dev --no-scripts --optimize-autoloader '
+            .'--ignore-platform-req=ext-pcntl --ignore-platform-req=ext-posix';
+        $this->runLocal(8, "composer {$composerArgs}", "{$composerCmd} {$composerArgs}", $tempDir);
 
         // Verify build output
-        $buildPath = $tempDir . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR . 'build';
+        $buildPath = $tempDir.DIRECTORY_SEPARATOR.'public'.DIRECTORY_SEPARATOR.'build';
         if (is_dir($buildPath) && count(scandir($buildPath)) > 2) {
-            $this->log(2, 9, 'success', null, 'Build assets verified at ' . $buildPath);
+            $this->log(2, 9, 'success', null, 'Build assets verified at '.$buildPath);
         } else {
             $this->log(2, 9, 'warning', null, 'No Vite build output found — continuing anyway');
         }
@@ -258,9 +317,9 @@ class DeployService
 
         $path = $this->site->source_path ?: base_path();
 
-        if (!is_dir($path)) {
+        if (! is_dir($path)) {
             throw new RuntimeException(
-                "Source path does not exist: {$path}. " .
+                "Source path does not exist: {$path}. ".
                 "Set 'Source Path' on the site to the local folder of the project you want to deploy."
             );
         }
@@ -294,18 +353,18 @@ class DeployService
         $this->log(3, 10, 'info', null, 'Phase 3: Uploading to server');
 
         // Step 10: Build zip archive locally (no rsync — works on Windows + Linux)
-        $zipPath = storage_path('app/deploy_' . $this->deployment->id . '.zip');
+        $zipPath = storage_path('app/deploy_'.$this->deployment->id.'.zip');
         $zipLog = DeployLog::record($this->deployment->id, 3, 10, 'info', null, 'Creating archive (0%)...');
         $this->createZipArchive($zipPath, function ($pct, $fileCount) use ($zipLog) {
             $zipLog->forceFill([
-                'output'    => "Creating archive ({$pct}%) — {$fileCount} files processed",
+                'output' => "Creating archive ({$pct}%) — {$fileCount} files processed",
                 'logged_at' => now(),
             ])->save();
         });
         $size = round(filesize($zipPath) / 1024 / 1024, 1);
         $zipLog->forceFill([
-            'status'    => 'success',
-            'output'    => "Archive created: {$size}MB",
+            'status' => 'success',
+            'output' => "Archive created: {$size}MB",
             'logged_at' => now(),
         ])->save();
 
@@ -313,24 +372,24 @@ class DeployService
         // front and update its `output` in place on every progress tick so the
         // live terminal shows real-time upload percentage instead of going
         // silent for several minutes on slow links.
-        $remoteTmp = '/tmp/autopilot_deploy_' . $this->deployment->id . '.zip';
+        $remoteTmp = '/tmp/autopilot_deploy_'.$this->deployment->id.'.zip';
         $progressLog = DeployLog::record(
             $this->deployment->id, 3, 11, 'info', null,
             "Uploading 0/{$size}MB (0%)..."
         );
         $onProgress = function ($sent, $total, $rateMbps, $pct) use ($progressLog) {
-            $sentMb  = round($sent / 1024 / 1024, 1);
+            $sentMb = round($sent / 1024 / 1024, 1);
             $totalMb = $total > 0 ? round($total / 1024 / 1024, 1) : 0;
             $progressLog->forceFill([
-                'output'    => "Uploading {$sentMb}/{$totalMb}MB ({$pct}%) at {$rateMbps} MB/s",
+                'output' => "Uploading {$sentMb}/{$totalMb}MB ({$pct}%) at {$rateMbps} MB/s",
                 'logged_at' => now(),
             ])->save();
         };
         $this->ssh->uploadFile($zipPath, $remoteTmp, $onProgress);
         @unlink($zipPath);
         $progressLog->forceFill([
-            'status'    => 'success',
-            'output'    => "Archive uploaded via SFTP ({$size}MB)",
+            'status' => 'success',
+            'output' => "Archive uploaded via SFTP ({$size}MB)",
             'logged_at' => now(),
         ])->save();
 
@@ -339,24 +398,24 @@ class DeployService
 
         // Step 12: Extract + cleanup in one single exec to avoid channel-reuse errors
         $deployPath = $this->site->deploy_path;
-        $path      = escapeshellarg($deployPath);
+        $path = escapeshellarg($deployPath);
         $remoteTmpQ = escapeshellarg($remoteTmp);
         // A non-root SSH user can't overwrite files the previous deploy handed to
         // the web user (Step 13b / 235), so reclaim ownership first — needs the
         // NOPASSWD chown/chmod sudoers rule (see asRoot()).
         $reclaim = $this->server->ssh_user !== 'root'
-            ? 'sudo -n chown -R ' . escapeshellarg($this->server->ssh_user . ($this->webUser() ? ':' . $this->webUser() : '')) . " {$path} 2>/dev/null; "
+            ? 'sudo -n chown -R '.escapeshellarg($this->server->ssh_user.($this->webUser() ? ':'.$this->webUser() : ''))." {$path} 2>/dev/null; "
             : '';
         $result = $this->ssh->exec(
-            "mkdir -p {$path} 2>/dev/null; {$reclaim}" .
-            "rm -rf {$deployPath}/vendor/laravel/pail {$deployPath}/vendor/laravel/telescope {$deployPath}/vendor/barryvdh/laravel-debugbar 2>/dev/null; " .
-            "unzip -oq {$remoteTmpQ} -d {$path} 2>&1 | tail -5; " .
-            "UNZIP_EXIT=\${PIPESTATUS[0]}; " .
-            "rm -f {$remoteTmpQ}; " .
-            "echo \"EXIT:\$UNZIP_EXIT\""
+            "mkdir -p {$path} 2>/dev/null; {$reclaim}".
+            "rm -rf {$deployPath}/vendor/laravel/pail {$deployPath}/vendor/laravel/telescope {$deployPath}/vendor/barryvdh/laravel-debugbar 2>/dev/null; ".
+            "unzip -oq {$remoteTmpQ} -d {$path} 2>&1 | tail -5; ".
+            'UNZIP_EXIT=${PIPESTATUS[0]}; '.
+            "rm -f {$remoteTmpQ}; ".
+            'echo "EXIT:$UNZIP_EXIT"'
         );
-        $exitCode = preg_match('/EXIT:(\d+)/', $result['output'] ?? '', $m) ? (int)$m[1] : 1;
-        $detail = $exitCode === 0 ? 'Extracted successfully' : 'Extract failed: ' . trim($result['output'] ?? '');
+        $exitCode = preg_match('/EXIT:(\d+)/', $result['output'] ?? '', $m) ? (int) $m[1] : 1;
+        $detail = $exitCode === 0 ? 'Extracted successfully' : 'Extract failed: '.trim($result['output'] ?? '');
         $this->log(3, 12, $exitCode === 0 ? 'success' : 'error', 'unzip', $detail, $exitCode);
 
         if ($exitCode !== 0) {
@@ -375,20 +434,20 @@ class DeployService
         // NEITHER manifest.json nor .vite/manifest.json — which, right after a
         // fresh extract, is true only of assets from older builds. If anything
         // looks off it deletes nothing and the deploy proceeds.
-        $buildDir = escapeshellarg($deployPath . '/public/build');
+        $buildDir = escapeshellarg($deployPath.'/public/build');
         $prune = $this->ssh->exec(
-            "B={$buildDir}; " .
-            'A="$B/assets"; ' .
-            'M="$B/manifest.json"; V="$B/.vite/manifest.json"; ' .
-            'if [ -d "$A" ] && [ -s "$M" ]; then ' .
-            '  KEEP=$(grep -ohaE "assets/[A-Za-z0-9_.-]+" "$M" "$V" 2>/dev/null | sed "s#assets/##" | sort -u); ' .
-            '  if [ -n "$KEEP" ]; then ' .
-            '    removed=0; ' .
-            '    for f in "$A"/*; do [ -e "$f" ] || continue; b=$(basename "$f"); ' .
-            '      printf "%s\n" "$KEEP" | grep -qxF "$b" || { rm -f "$f"; removed=$((removed+1)); }; ' .
-            '    done; ' .
-            '    echo "PRUNED:$removed"; ' .
-            '  else echo "PRUNED:skip-no-refs"; fi; ' .
+            "B={$buildDir}; ".
+            'A="$B/assets"; '.
+            'M="$B/manifest.json"; V="$B/.vite/manifest.json"; '.
+            'if [ -d "$A" ] && [ -s "$M" ]; then '.
+            '  KEEP=$(grep -ohaE "assets/[A-Za-z0-9_.-]+" "$M" "$V" 2>/dev/null | sed "s#assets/##" | sort -u); '.
+            '  if [ -n "$KEEP" ]; then '.
+            '    removed=0; '.
+            '    for f in "$A"/*; do [ -e "$f" ] || continue; b=$(basename "$f"); '.
+            '      printf "%s\n" "$KEEP" | grep -qxF "$b" || { rm -f "$f"; removed=$((removed+1)); }; '.
+            '    done; '.
+            '    echo "PRUNED:$removed"; '.
+            '  else echo "PRUNED:skip-no-refs"; fi; '.
             'else echo "PRUNED:skip-no-manifest"; fi'
         );
         $this->log(3, 12, 'success', 'prune stale build assets', trim($prune['output'] ?? ''));
@@ -407,16 +466,16 @@ class DeployService
         ];
         $mkdirCmd = '';
         foreach ($ensureDirs as $dir) {
-            $mkdirCmd .= "mkdir -p {$path}/" . escapeshellarg($dir) . " && ";
+            $mkdirCmd .= "mkdir -p {$path}/".escapeshellarg($dir).' && ';
         }
         $chmodExtra = '';
         foreach ($writableDirs as $dir) {
-            $chmodExtra .= " && chmod -R 775 {$path}/" . escapeshellarg($dir);
+            $chmodExtra .= " && chmod -R 775 {$path}/".escapeshellarg($dir);
         }
         $this->ssh->exec(
-            $mkdirCmd .
-            "find {$path} -type d -exec chmod 755 {} \\; && " .
-            "find {$path} -type f -exec chmod 644 {} \\;" .
+            $mkdirCmd.
+            "find {$path} -type d -exec chmod 755 {} \\; && ".
+            "find {$path} -type f -exec chmod 644 {} \\;".
             $chmodExtra
         );
         $this->log(3, 13, 'success', null, 'Runtime dirs ensured + permissions set (755/644, writable dirs 775)');
@@ -433,13 +492,13 @@ class DeployService
             // group-writable); the final chown after artisan (step 235) hands
             // everything to the web user.
             $ownerUser = $this->server->ssh_user === 'root' ? $webUser : $this->server->ssh_user;
-            $owner = escapeshellarg($ownerUser . ':' . $webUser);
+            $owner = escapeshellarg($ownerUser.':'.$webUser);
             $this->ssh->exec($this->asRoot("chown -R {$owner} {$path}"));
             $this->log(3, 13, 'success', null, "Ownership set to {$ownerUser}:{$webUser} on {$this->site->deploy_path}");
         } else {
             $this->log(3, 13, 'warning', null,
-                'No web_user configured on server — skipping chown. ' .
-                'Laravel may fail to write storage/ or bootstrap/cache/. ' .
+                'No web_user configured on server — skipping chown. '.
+                'Laravel may fail to write storage/ or bootstrap/cache/. '.
                 'Edit the server and set "Web User" (aaPanel: www, cPanel/OpenPanel: your account user).');
         }
 
@@ -476,18 +535,20 @@ class DeployService
 
     private function syncStorageAppPublic(?string $webUser): void
     {
-        $localDir = rtrim($this->getSourcePath(), '/\\') . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'app' . DIRECTORY_SEPARATOR . 'public';
-        if (!is_dir($localDir)) {
+        $localDir = rtrim($this->getSourcePath(), '/\\').DIRECTORY_SEPARATOR.'storage'.DIRECTORY_SEPARATOR.'app'.DIRECTORY_SEPARATOR.'public';
+        if (! is_dir($localDir)) {
             $this->log(3, 13, 'info', null, 'No local storage/app/public/ — skipping asset sync.');
+
             return;
         }
 
-        $assetZip = storage_path('app/tmp_assets_' . $this->deployment->id . '.zip');
+        $assetZip = storage_path('app/tmp_assets_'.$this->deployment->id.'.zip');
         @mkdir(dirname($assetZip), 0775, true);
 
-        $zip = new \ZipArchive();
+        $zip = new \ZipArchive;
         if ($zip->open($assetZip, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
             $this->log(3, 13, 'warning', null, 'Could not create asset zip — skipping.');
+
             return;
         }
         $files = new \RecursiveIteratorIterator(
@@ -496,9 +557,13 @@ class DeployService
         );
         $count = 0;
         foreach ($files as $file) {
-            if (!$file->isFile()) continue;
+            if (! $file->isFile()) {
+                continue;
+            }
             $rel = str_replace('\\', '/', substr($file->getRealPath(), strlen($localDir) + 1));
-            if (str_starts_with($rel, 'livewire-tmp/')) continue;
+            if (str_starts_with($rel, 'livewire-tmp/')) {
+                continue;
+            }
             $zip->addFile($file->getRealPath(), $rel);
             $count++;
         }
@@ -507,6 +572,7 @@ class DeployService
         if ($count === 0) {
             @unlink($assetZip);
             $this->log(3, 13, 'info', null, 'storage/app/public/ is empty — skipping asset sync.');
+
             return;
         }
 
@@ -518,23 +584,23 @@ class DeployService
         // avoids landing in that window (uploadFile() itself also retries/backs off).
         usleep(500_000);
 
-        $remoteTmp = '/tmp/autopilot_assets_' . $this->deployment->id . '.zip';
+        $remoteTmp = '/tmp/autopilot_assets_'.$this->deployment->id.'.zip';
         $this->ssh->uploadFile($assetZip, $remoteTmp);
         @unlink($assetZip);
         $this->ssh->reconnect();
 
-        $remoteTarget = escapeshellarg($this->site->deploy_path . '/storage/app/public');
-        $remoteTmpQ   = escapeshellarg($remoteTmp);
+        $remoteTarget = escapeshellarg($this->site->deploy_path.'/storage/app/public');
+        $remoteTmpQ = escapeshellarg($remoteTmp);
         $this->ssh->exec(
-            "mkdir -p {$remoteTarget} && " .
-            "unzip -oq {$remoteTmpQ} -d {$remoteTarget} > /dev/null 2>&1; " .
+            "mkdir -p {$remoteTarget} && ".
+            "unzip -oq {$remoteTmpQ} -d {$remoteTarget} > /dev/null 2>&1; ".
             "rm -f {$remoteTmpQ}"
         );
 
         if ($webUser) {
             $this->ssh->reconnect();
-            $owner = escapeshellarg($webUser . ':' . $webUser);
-            $this->ssh->exec($this->asRoot("chown -R {$owner} {$remoteTarget}") . ' && ' . $this->asRoot("chmod -R 775 {$remoteTarget}"));
+            $owner = escapeshellarg($webUser.':'.$webUser);
+            $this->ssh->exec($this->asRoot("chown -R {$owner} {$remoteTarget}").' && '.$this->asRoot("chmod -R 775 {$remoteTarget}"));
         }
 
         $this->log(3, 13, 'success', null, "Synced {$count} file(s) to storage/app/public/");
@@ -557,10 +623,10 @@ class DeployService
         ]);
 
         $baseDir = $this->getSourcePath();
-        $zip     = new \ZipArchive();
+        $zip = new \ZipArchive;
 
         if ($zip->open($zipPath, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
-            throw new RuntimeException('Cannot create zip archive at ' . $zipPath);
+            throw new RuntimeException('Cannot create zip archive at '.$zipPath);
         }
 
         // Collect files first to know total count for progress
@@ -571,9 +637,11 @@ class DeployService
         );
 
         foreach ($iter as $file) {
-            if (!$file->isFile()) continue;
+            if (! $file->isFile()) {
+                continue;
+            }
 
-            $realPath     = $file->getRealPath();
+            $realPath = $file->getRealPath();
             $relativePath = str_replace('\\', '/', substr($realPath, strlen($baseDir) + 1));
 
             $skip = false;
@@ -584,13 +652,13 @@ class DeployService
                     break;
                 }
             }
-            if (!$skip) {
+            if (! $skip) {
                 $allFiles[] = [$realPath, $relativePath];
             }
         }
 
-        $total      = count($allFiles);
-        $lastPct    = -1;
+        $total = count($allFiles);
+        $lastPct = -1;
         $lastUpdate = 0;
 
         foreach ($allFiles as $i => [$realPath, $relativePath]) {
@@ -602,7 +670,7 @@ class DeployService
                 // Update every 2% or every 2 seconds
                 if ($pct >= $lastPct + 2 || $now > $lastUpdate + 2) {
                     $onProgress($pct, $i + 1);
-                    $lastPct    = $pct;
+                    $lastPct = $pct;
                     $lastUpdate = $now;
                 }
             }
@@ -618,9 +686,9 @@ class DeployService
 
         // Write .env to remote server before any artisan commands
         if ($this->site->env_content) {
-            $envPath = $this->site->deploy_path . '/.env';
+            $envPath = $this->site->deploy_path.'/.env';
             $this->ssh->uploadContent($this->site->env_content, $envPath);
-            $this->log(4, 14, 'success', null, '.env written to ' . $envPath . ' (credentials masked)');
+            $this->log(4, 14, 'success', null, '.env written to '.$envPath.' (credentials masked)');
         } else {
             $this->log(4, 14, 'warning', null, 'No .env configured for this site — skipping .env write. Migrations may fail.');
         }
@@ -646,16 +714,16 @@ class DeployService
                 $safeUser = escapeshellarg($dbUser);
                 $grantCmd = "psql -U postgres -c \"ALTER USER {$safeUser} CREATEDB;\" 2>&1";
                 $grantResult = $this->ssh->exec($grantCmd);
-                $grantExit   = $grantResult['exit_code'] ?? 1;
+                $grantExit = $grantResult['exit_code'] ?? 1;
                 $this->log(4, 14, $grantExit === 0 ? 'success' : 'warning',
-                    "psql -U postgres -c \"ALTER USER [DB_USERNAME] CREATEDB;\"",
+                    'psql -U postgres -c "ALTER USER [DB_USERNAME] CREATEDB;"',
                     $grantResult['output'] ?? '', $grantExit);
             } else {
                 $this->log(4, 14, 'warning', null, 'grant_createdb: could not parse DB_USERNAME from .env — skipping.');
             }
         }
 
-        $php  = escapeshellarg($this->site->php_binary);
+        $php = escapeshellarg($this->site->php_binary);
         $path = escapeshellarg($this->site->deploy_path);
         $token = bin2hex(random_bytes(16));
 
@@ -682,22 +750,28 @@ class DeployService
             // not found" boot crash that took the site down when the cache was cleared
             // but never rebuilt.
             147 => "cd {$path} && {$php} artisan package:discover --no-interaction 2>&1 || true",
-            15  => "cd {$path} && {$php} artisan down --retry=60 --secret={$token} 2>&1",
+            15 => "cd {$path} && {$php} artisan down --retry=60 --secret={$token} 2>&1",
             150 => "cd {$path} && {$php} artisan optimize:clear 2>&1",
         ] as $earlyStep => $earlyCmd) {
             $earlyResult = $this->ssh->exec($earlyCmd);
-            $earlyExit   = $earlyResult['exit_code'] ?? 1;
+            $earlyExit = $earlyResult['exit_code'] ?? 1;
             $this->log(4, $earlyStep, $earlyExit === 0 ? 'success' : 'error',
                 $earlyCmd, $earlyResult['output'] ?? '', $earlyExit);
+
+            // From here on the site serves a 503 until step 23 lifts it, so any
+            // throw in between must be caught by run() and trigger liftMaintenance().
+            if ($earlyStep === 15 && $earlyExit === 0) {
+                $this->maintenanceOn = true;
+            }
         }
 
         // Optional: pre-migrate commands (one per line, e.g. "php artisan tenancy:install").
         // Run before migrate --force so setup commands (publishing migrations, etc.) complete first.
-        if (!empty($this->site->pre_migrate_commands)) {
+        if (! empty($this->site->pre_migrate_commands)) {
             $lines = array_filter(array_map('trim', explode("\n", $this->site->pre_migrate_commands)));
             foreach ($lines as $i => $line) {
                 $cmdResult = $this->ssh->exec("cd {$path} && {$line} 2>&1");
-                $cmdExit   = $cmdResult['exit_code'] ?? 1;
+                $cmdExit = $cmdResult['exit_code'] ?? 1;
                 $this->log(4, 155 + $i, $cmdExit === 0 ? 'success' : 'warning',
                     $line, $cmdResult['output'] ?? '', $cmdExit);
             }
@@ -711,7 +785,7 @@ class DeployService
             // re-deploys overwrite rather than duplicate. (Previously push ran first,
             // which failed with "table doesn't exist" on a brand-new remote database.)
             $migrateResult = $this->ssh->exec("cd {$path} && {$php} artisan migrate --force 2>&1");
-            $migrateExit   = $migrateResult['exit_code'] ?? 1;
+            $migrateExit = $migrateResult['exit_code'] ?? 1;
             $this->log(4, 16, $migrateExit === 0 ? 'success' : 'error',
                 "cd {$path} && {$php} artisan migrate --force 2>&1",
                 $migrateResult['output'] ?? '', $migrateExit);
@@ -721,7 +795,7 @@ class DeployService
             $this->pushLocalDatabase();
         } else {
             $migrateResult = $this->ssh->exec("cd {$path} && {$php} artisan migrate --force 2>&1");
-            $migrateExit   = $migrateResult['exit_code'] ?? 1;
+            $migrateExit = $migrateResult['exit_code'] ?? 1;
             $this->log(4, 16, $migrateExit === 0 ? 'success' : 'error',
                 "cd {$path} && {$php} artisan migrate --force 2>&1",
                 $migrateResult['output'] ?? '', $migrateExit);
@@ -736,7 +810,7 @@ class DeployService
         // Runs `tenants:migrate` on all tenant DBs after the central DB is migrated.
         if ($this->site->run_tenant_migrations) {
             $tenantMigrateResult = $this->ssh->exec("cd {$path} && {$php} artisan tenants:migrate --force 2>&1");
-            $tenantMigrateExit   = $tenantMigrateResult['exit_code'] ?? 1;
+            $tenantMigrateExit = $tenantMigrateResult['exit_code'] ?? 1;
             $this->log(4, 16, $tenantMigrateExit === 0 ? 'success' : 'error',
                 "cd {$path} && {$php} artisan tenants:migrate --force 2>&1",
                 $tenantMigrateResult['output'] ?? '', $tenantMigrateExit);
@@ -771,9 +845,9 @@ class DeployService
             // Each command is allowed to "fail" (|| true) since not every
             // project installs every package; we only care that the ones
             // present are published.
-            215 => "cd {$path} && ({$php} artisan livewire:publish --assets 2>&1 || true)",
-            216 => "cd {$path} && ({$php} artisan filament:assets 2>&1 || true)",
-            217 => "cd {$path} && ({$php} artisan vendor:publish --tag=livewire:assets --force 2>&1 || true)",
+            // Steps 215/216/217 (livewire:publish, filament:assets) removed in
+            // UPGRADE-v2 Phase 1 — this project dropped FilamentPHP, and the
+            // commands were `|| true` no-ops costing three SSH round-trips.
             22 => "cd {$path} && {$php} artisan queue:restart 2>&1",
             23 => "cd {$path} && {$php} artisan up 2>&1",
         ];
@@ -785,8 +859,8 @@ class DeployService
         // → 500 "Permission denied" on the live site.
         $webUser = $this->webUser();
         if ($webUser) {
-            $owner = escapeshellarg($webUser . ':' . $webUser);
-            $commands[235] = $this->asRoot("chown -R {$owner} {$path}") . ' 2>/dev/null; true';
+            $owner = escapeshellarg($webUser.':'.$webUser);
+            $commands[235] = $this->asRoot("chown -R {$owner} {$path}").' 2>/dev/null; true';
         }
 
         ksort($commands);
@@ -802,8 +876,13 @@ class DeployService
 
             $this->log(4, $step, $status, $cmd, $result['output'], $result['exit_code']);
 
+            // Site is live again — run()'s catch no longer needs to lift it.
+            if ($step === 23 && $status === 'success') {
+                $this->maintenanceOn = false;
+            }
+
             if ($status === 'error' && in_array($step, [16, 23])) {
-                throw new RuntimeException("Critical step {$step} failed: " . $result['output']);
+                throw new RuntimeException("Critical step {$step} failed: ".$result['output']);
             }
         }
 
@@ -816,13 +895,14 @@ class DeployService
         $this->log(5, 24, 'info', null, 'Phase 5: Health check');
 
         $appUrl = $this->site->app_url;
-        if (!$appUrl) {
+        if (! $appUrl) {
             $this->log(5, 24, 'warning', null, 'No app_url configured — skipping HTTP health check');
+
             return true;
         }
 
-        $endpoint = rtrim($appUrl, '/') . config('autopilot.health.endpoint', '/health');
-        $ok       = true;
+        $endpoint = rtrim($appUrl, '/').config('autopilot.health.endpoint', '/health');
+        $ok = true;
 
         try {
             // SSL verification disabled — we trust the server we just deployed to.
@@ -831,7 +911,7 @@ class DeployService
             $response = Http::withoutVerifying()
                 ->timeout(config('autopilot.health.timeout', 10))
                 ->get($endpoint);
-            $status   = $response->status();
+            $status = $response->status();
             $expected = config('autopilot.health.expected_codes', [200]);
 
             if (in_array($status, $expected)) {
@@ -840,9 +920,9 @@ class DeployService
                 // 4xx typically means the app is up but /health route doesn't exist.
                 // That's not a deployment failure — warn and continue.
                 $this->log(5, 24, 'warning', "GET {$endpoint}",
-                    "HTTP {$status} — health endpoint not found or not configured. " .
-                    "App appears reachable; skipping rollback. " .
-                    "Add a /health route to the app (or change autopilot.health.endpoint) to get true health verification.");
+                    "HTTP {$status} — health endpoint not found or not configured. ".
+                    'App appears reachable; skipping rollback. '.
+                    'Add a /health route to the app (or change autopilot.health.endpoint) to get true health verification.');
             } else {
                 // 5xx / unexpected — warn but don't rollback.
                 // The deploy itself may be fine; the 500 could be a missing
@@ -850,14 +930,14 @@ class DeployService
                 // Rolling back a successful deploy is more destructive than
                 // leaving it up for manual inspection.
                 $this->log(5, 24, 'warning', "GET {$endpoint}",
-                    "HTTP {$status} — server returned an error. " .
-                    "Deploy will NOT be rolled back automatically. " .
-                    "Check the remote Laravel log for details.");
+                    "HTTP {$status} — server returned an error. ".
+                    'Deploy will NOT be rolled back automatically. '.
+                    'Check the remote Laravel log for details.');
             }
         } catch (\Throwable $e) {
             // Connection error (DNS, timeout, etc.) — warn only, no rollback
             $this->log(5, 24, 'warning', "GET {$endpoint}",
-                'Health check unreachable: ' . $e->getMessage() . ' — skipping rollback.');
+                'Health check unreachable: '.$e->getMessage().' — skipping rollback.');
         }
 
         // Step 25-26: Check Laravel logs
@@ -869,17 +949,18 @@ class DeployService
                 $analysis = $this->claude->analysePostDeployLogs($logOutput);
                 $aiStatus = $analysis['status'] ?? 'ok';
                 $logStatus = $aiStatus === 'critical' ? 'error' : ($aiStatus === 'warning' ? 'warning' : 'success');
-                $this->log(5, 26, $logStatus, null, 'AI log analysis: ' . json_encode($analysis), null, $analysis);
+                $this->log(5, 26, $logStatus, null, 'AI log analysis: '.json_encode($analysis), null, $analysis);
 
                 if ($aiStatus === 'critical') {
                     $this->log(5, 26, 'warning', null, 'AI flagged critical issues in logs, but rollback is not triggered automatically — inspect logs manually.');
                 }
             } catch (\Throwable $e) {
-                $this->log(5, 26, 'warning', null, 'AI analysis failed: ' . $e->getMessage());
+                $this->log(5, 26, 'warning', null, 'AI analysis failed: '.$e->getMessage());
             }
         }
 
         $this->broadcastPhase(5, 'Health check complete');
+
         return $ok ?? false;
     }
 
@@ -897,29 +978,69 @@ class DeployService
     private function pushLocalDatabase(): void
     {
         $sourcePath = $this->getSourcePath();
-        if (!$sourcePath || !is_dir($sourcePath)) {
+        if (! $sourcePath || ! is_dir($sourcePath)) {
             $this->log(4, 162, 'warning', null, 'with_database=true but no local source_path — skipping DB push.');
+
             return;
         }
 
         $this->log(4, 162, 'info', null, 'Dumping local database and pushing to server…');
 
         try {
-            $sync   = app(DatabaseSyncService::class);
+            $sync = app(DatabaseSyncService::class);
             $result = $sync->pushLocalToRemote($this->ssh, $this->site, $sourcePath, $this->deployment->id);
             $this->log(4, 162, 'success', null,
                 "Database pushed: {$result['sizeMb']} MB dump imported on server.");
         } catch (\Throwable $e) {
             // DB push is invasive; fail loud so the user knows it didn't apply.
-            $this->log(4, 162, 'error', null, 'Database push failed: ' . $e->getMessage());
+            $this->log(4, 162, 'error', null, 'Database push failed: '.$e->getMessage());
             throw $e;
+        }
+    }
+
+    /**
+     * Bring the site out of maintenance after a failed deploy.
+     *
+     * Best-effort by design: it runs from run()'s catch block, where the
+     * original exception is the one the user needs to see. If the SSH channel
+     * is already dead we log that and let the real error propagate rather than
+     * masking it with a connection failure.
+     */
+    private function liftMaintenance(): void
+    {
+        if (! $this->maintenanceOn) {
+            return;
+        }
+
+        $this->maintenanceOn = false;
+
+        try {
+            // The deploy failed somewhere mid-flight, so the channel may be in a
+            // bad state — reconnect before spending our one attempt on `up`.
+            $this->ssh->reconnect();
+
+            $php = $this->site->php_binary ?: 'php';
+            $cmd = "cd {$this->site->deploy_path} && {$php} artisan up 2>&1";
+
+            $result = $this->ssh->exec($cmd);
+            $exit = $result['exit_code'] ?? 1;
+
+            $this->log(4, 23, $exit === 0 ? 'success' : 'error', $cmd,
+                ($exit === 0 ? 'Site taken out of maintenance after failed deploy. ' : '')
+                .($result['output'] ?? ''), $exit);
+        } catch (\Throwable $e) {
+            $this->log(4, 23, 'error', null,
+                'Could not lift maintenance mode after failed deploy — the site is '
+                .'still showing the 503 page. Run "artisan up" on the server manually. '
+                .'Reason: '.$e->getMessage());
         }
     }
 
     private function getRemoteErrorLog(): string
     {
-        $path   = escapeshellarg($this->site->deploy_path . '/storage/logs/laravel.log');
+        $path = escapeshellarg($this->site->deploy_path.'/storage/logs/laravel.log');
         $result = $this->ssh->exec("tail -50 {$path} 2>/dev/null");
+
         return $result['output'] ?? '';
     }
 

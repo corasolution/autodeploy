@@ -18,21 +18,84 @@ class DatabaseSyncService
 {
     /** Raw .env bodies, kept so tenancy settings can be read beyond DB_* keys. */
     private string $localEnvRaw = '';
+
     private string $remoteEnvRaw = '';
 
     /**
      * @return array{rows:int, sizeMb:float}
      */
+    /**
+     * Dump the remote database to {deploy_path}/shared/backups/{id}.sql.gz
+     * before a push overwrites it.
+     *
+     * Hard failure by design: if we cannot prove a backup exists, we do not
+     * proceed to overwrite live data. Credentials go through the environment
+     * (PGPASSWORD / MYSQL_PWD) so they never appear in the process list.
+     */
+    private function backupRemoteDatabase(
+        SshService $ssh,
+        Site $site,
+        array $remote,
+        int $deploymentId,
+    ): void {
+        $dir = rtrim($site->deploy_path, '/').'/shared/backups';
+        $file = $dir.'/'.$deploymentId.'.sql.gz';
+
+        $ssh->exec('mkdir -p '.escapeshellarg($dir));
+
+        $host = escapeshellarg($remote['host']);
+        $port = escapeshellarg((string) $remote['port']);
+        $user = escapeshellarg($remote['user']);
+        $db = escapeshellarg($remote['database']);
+        $out = escapeshellarg($file);
+
+        // Dump to a plain file first, then compress. Piping straight into gzip
+        // would mask a failed dump behind gzip's exit code, and PIPESTATUS is a
+        // bashism we can't rely on across login shells. `&&` short-circuits in
+        // any POSIX shell, so a failed dump never produces a backup file.
+        $tmp = '/tmp/autopilot_backup_'.$deploymentId.'.sql';
+        $tmpArg = escapeshellarg($tmp);
+
+        if ($remote['driver'] === 'pgsql') {
+            $dump = 'PGPASSWORD='.escapeshellarg($remote['password'])
+                ." pg_dump -h {$host} -p {$port} -U {$user} {$db} > {$tmpArg}";
+        } else {
+            $dump = 'MYSQL_PWD='.escapeshellarg($remote['password'])
+                ." mysqldump --host={$host} --port={$port} --user={$user} --single-transaction --quick {$db} > {$tmpArg}";
+        }
+
+        $cmd = "{$dump} && gzip -f {$tmpArg} && mv ".escapeshellarg($tmp.'.gz')." {$out}";
+
+        $result = $ssh->exec($cmd.' 2>&1');
+        $exit = $result['exit_code'] ?? 1;
+
+        if ($exit !== 0) {
+            throw new RuntimeException(
+                'Refusing to push: remote database backup failed (exit '.$exit.'). '
+                .'No data was overwritten. Output: '.trim($result['output'] ?? '')
+            );
+        }
+
+        $size = trim($ssh->exec('stat -c %s '.$out.' 2>/dev/null || echo 0')['output'] ?? '0');
+
+        if ((int) $size <= 0) {
+            throw new RuntimeException(
+                'Refusing to push: remote database backup is empty ('.$file.'). '
+                .'No data was overwritten.'
+            );
+        }
+    }
+
     public function pushLocalToRemote(
         SshService $ssh,
         Site $site,
         string $sourcePath,
         int $deploymentId,
     ): array {
-        $this->localEnvRaw  = $this->readLocalEnv($sourcePath);
+        $this->localEnvRaw = $this->readLocalEnv($sourcePath);
         $this->remoteEnvRaw = $site->env_content ?? '';
 
-        $local  = $this->parseEnvDb($this->localEnvRaw);
+        $local = $this->parseEnvDb($this->localEnvRaw);
         $remote = $this->parseEnvDb($this->remoteEnvRaw);
 
         $this->assertCreds($local, 'local');
@@ -40,13 +103,17 @@ class DatabaseSyncService
 
         if ($local['driver'] !== $remote['driver']) {
             throw new RuntimeException(
-                "DB_CONNECTION mismatch: local is {$local['driver']}, remote is {$remote['driver']}. " .
-                "Cross-engine sync is not supported."
+                "DB_CONNECTION mismatch: local is {$local['driver']}, remote is {$remote['driver']}. ".
+                'Cross-engine sync is not supported.'
             );
         }
 
-        $dumpFile  = storage_path('app/db_push_' . $deploymentId . '.sql');
-        $remoteTmp = '/tmp/autopilot_db_' . $deploymentId . '.sql';
+        $dumpFile = storage_path('app/db_push_'.$deploymentId.'.sql');
+        $remoteTmp = '/tmp/autopilot_db_'.$deploymentId.'.sql';
+
+        // F7: take a remote backup BEFORE overwriting anything. The import uses
+        // REPLACE, so without this a bad push is unrecoverable.
+        $this->backupRemoteDatabase($ssh, $site, $remote, $deploymentId);
 
         try {
             if ($local['driver'] === 'pgsql') {
@@ -104,7 +171,7 @@ class DatabaseSyncService
         if ($local['driver'] !== 'pgsql') {
             throw new RuntimeException(
                 'Tenant database push currently supports PostgreSQL only; '
-                . "this site is {$local['driver']}."
+                ."this site is {$local['driver']}."
             );
         }
 
@@ -118,7 +185,7 @@ class DatabaseSyncService
         $total = 0.0;
 
         foreach ($tenants as $i => [$uuid, $storedDbName]) {
-            $localDb = $storedDbName ?: ($localPrefix . $uuid);
+            $localDb = $storedDbName ?: ($localPrefix.$uuid);
 
             // The REMOTE database must carry the same name, because stancl reads
             // tenancy_db_name out of the tenant row's data JSON — and that row has
@@ -128,7 +195,7 @@ class DatabaseSyncService
             // success, and every request then 500s with "database … does not exist".
             $remoteDb = $localDb;
 
-            $dumpFile  = storage_path("app/db_tenant_{$deploymentId}_{$i}.sql");
+            $dumpFile = storage_path("app/db_tenant_{$deploymentId}_{$i}.sql");
             $remoteTmp = "/tmp/autopilot_tenant_{$deploymentId}_{$i}.sql";
 
             try {
@@ -171,8 +238,10 @@ class DatabaseSyncService
                 || (str_starts_with($val, "'") && str_ends_with($val, "'"))) {
                 $val = substr($val, 1, -1);
             }
+
             return $val;
         }
+
         return config('autopilot.tenancy.default_prefix', 'alpha_elibrary_tenant_');
     }
 
@@ -188,24 +257,25 @@ class DatabaseSyncService
     private function localTenantIds(array $c): array
     {
         $psql = escapeshellarg(config('autopilot.pgsql.client_binary', 'psql'));
-        $cmd  = $psql
-            . ' --host=' . escapeshellarg($c['host'])
-            . ' --port=' . escapeshellarg($c['port'])
-            . ' --username=' . escapeshellarg($c['user'])
-            . ' --dbname=' . escapeshellarg($c['db'])
-            . ' -tAc ' . escapeshellarg(
+        $cmd = $psql
+            .' --host='.escapeshellarg($c['host'])
+            .' --port='.escapeshellarg($c['port'])
+            .' --username='.escapeshellarg($c['user'])
+            .' --dbname='.escapeshellarg($c['db'])
+            .' -tAc '.escapeshellarg(
                 "SELECT id || '\t' || COALESCE(data->>'tenancy_db_name', '') FROM tenants"
             )
-            . ' 2>&1';
+            .' 2>&1';
 
         $ids = [];
         $this->withEnv('PGPASSWORD', $c['pass'], function () use ($cmd, &$ids) {
-            $out = []; $exit = 0;
+            $out = [];
+            $exit = 0;
             exec($cmd, $out, $exit);
             if ($exit !== 0) {
                 throw new RuntimeException(
                     'Could not read tenants from the local central database: '
-                    . trim(implode("\n", $out))
+                    .trim(implode("\n", $out))
                 );
             }
             foreach ($out as $line) {
@@ -225,21 +295,21 @@ class DatabaseSyncService
     private function ensureRemoteDatabase(SshService $ssh, array $c, string $db): void
     {
         $psqlBin = escapeshellarg(config('autopilot.pgsql.remote_client_binary', 'psql'));
-        $base    = "PGPASSWORD=" . escapeshellarg($c['pass']) . " {$psqlBin}"
-            . ' --host=' . escapeshellarg($c['host'])
-            . ' --port=' . escapeshellarg($c['port'])
-            . ' --username=' . escapeshellarg($c['user']);
+        $base = 'PGPASSWORD='.escapeshellarg($c['pass'])." {$psqlBin}"
+            .' --host='.escapeshellarg($c['host'])
+            .' --port='.escapeshellarg($c['port'])
+            .' --username='.escapeshellarg($c['user']);
 
         // Connect to the central DB to issue CREATE DATABASE — you cannot create a
         // database from inside the one being created, and "postgres" may not be
         // reachable for this role.
         $check = $ssh->exec(
-            $base . ' --dbname=' . escapeshellarg($c['db'])
+            $base.' --dbname='.escapeshellarg($c['db'])
             // Double-quoted for the remote shell so the single quotes Postgres needs
             // around the string literal survive — escapeshellarg() would not, for the
             // Windows reason described below.
-            . " -tAc \"SELECT 1 FROM pg_database WHERE datname = '{$db}'\""
-            . ' 2>&1'
+            ." -tAc \"SELECT 1 FROM pg_database WHERE datname = '{$db}'\""
+            .' 2>&1'
         );
 
         if (trim($check['output'] ?? '') === '1') {
@@ -247,33 +317,34 @@ class DatabaseSyncService
         }
 
         $create = $ssh->exec(
-            $base . ' --dbname=' . escapeshellarg($c['db'])
+            $base.' --dbname='.escapeshellarg($c['db'])
             // Quoted by hand, not with escapeshellarg(): this runs from Windows,
             // where escapeshellarg() emits DOUBLE quotes and mangles the inner ones
             // the identifier needs. A tenant database name contains hyphens (it ends
             // in a uuid), so Postgres rejects it unquoted — CREATE DATABASE
             // alpha_elibrary_tenant_ee10543c-20a4-… is a syntax error at "-".
-            . " -c 'CREATE DATABASE \"{$db}\"'"
-            . ' 2>&1; echo "CREATE_EXIT:$?"'
+            ." -c 'CREATE DATABASE \"{$db}\"'"
+            .' 2>&1; echo "CREATE_EXIT:$?"'
         );
 
         $exit = preg_match('/CREATE_EXIT:(\d+)/', $create['output'] ?? '', $m) ? (int) $m[1] : 1;
         if ($exit !== 0) {
             throw new RuntimeException(
                 "Could not create remote tenant database {$db}: "
-                . preg_replace('/CREATE_EXIT:\d+\s*$/', '', $create['output'] ?? '')
+                .preg_replace('/CREATE_EXIT:\d+\s*$/', '', $create['output'] ?? '')
             );
         }
     }
 
     private function readLocalEnv(string $sourcePath): string
     {
-        $envPath = rtrim($sourcePath, '/\\') . DIRECTORY_SEPARATOR . '.env';
-        if (!is_file($envPath)) {
+        $envPath = rtrim($sourcePath, '/\\').DIRECTORY_SEPARATOR.'.env';
+        if (! is_file($envPath)) {
             throw new RuntimeException(
                 "Local .env not found at {$envPath}. Cannot read local DB credentials."
             );
         }
+
         return (string) file_get_contents($envPath);
     }
 
@@ -288,15 +359,17 @@ class DatabaseSyncService
         $env = preg_replace('/\r\n?/', "\n", $env);
 
         $get = function (string $key) use ($env): string {
-            if (preg_match('/^[ \t]*' . preg_quote($key, '/') . '[ \t]*=[ \t]*([^\r\n]*)$/m', $env, $m)) {
+            if (preg_match('/^[ \t]*'.preg_quote($key, '/').'[ \t]*=[ \t]*([^\r\n]*)$/m', $env, $m)) {
                 $val = trim($m[1]);
                 $val = preg_replace('/\s+#.*$/', '', $val);
                 if ((str_starts_with($val, '"') && str_ends_with($val, '"'))
                     || (str_starts_with($val, "'") && str_ends_with($val, "'"))) {
                     $val = substr($val, 1, -1);
                 }
+
                 return $val;
             }
+
             return '';
         };
 
@@ -305,11 +378,11 @@ class DatabaseSyncService
 
         return [
             'driver' => $driver,
-            'host'   => $get('DB_HOST') ?: '127.0.0.1',
-            'port'   => $get('DB_PORT') ?: $defaultPort,
-            'db'     => $get('DB_DATABASE'),
-            'user'   => $get('DB_USERNAME'),
-            'pass'   => $get('DB_PASSWORD'),
+            'host' => $get('DB_HOST') ?: '127.0.0.1',
+            'port' => $get('DB_PORT') ?: $defaultPort,
+            'db' => $get('DB_DATABASE'),
+            'user' => $get('DB_USERNAME'),
+            'pass' => $get('DB_PASSWORD'),
         ];
     }
 
@@ -320,7 +393,7 @@ class DatabaseSyncService
                 "Missing DB_DATABASE or DB_USERNAME in {$label} .env — cannot sync database."
             );
         }
-        if (!in_array($c['driver'], ['mysql', 'mariadb', 'pgsql'], true)) {
+        if (! in_array($c['driver'], ['mysql', 'mariadb', 'pgsql'], true)) {
             throw new RuntimeException(
                 "Unsupported DB_CONNECTION '{$c['driver']}' in {$label} .env — only mysql/mariadb/pgsql are supported."
             );
@@ -331,13 +404,13 @@ class DatabaseSyncService
 
     private function dumpLocalMysql(array $c, string $outFile): void
     {
-        $bin  = config('autopilot.mysql.dump_binary', 'mysqldump');
+        $bin = config('autopilot.mysql.dump_binary', 'mysqldump');
         $skip = (array) config('autopilot.mysql.skip_tables', []);
 
         $args = [
-            '--host=' . $c['host'],
-            '--port=' . $c['port'],
-            '--user=' . $c['user'],
+            '--host='.$c['host'],
+            '--port='.$c['port'],
+            '--user='.$c['user'],
             '--single-transaction',
             '--quick',
             '--no-create-info',
@@ -350,24 +423,25 @@ class DatabaseSyncService
             '--default-character-set=utf8mb4',
         ];
         foreach ($skip as $t) {
-            $args[] = '--ignore-table=' . $c['db'] . '.' . $t;
+            $args[] = '--ignore-table='.$c['db'].'.'.$t;
         }
         $args[] = $c['db'];
 
         $cmd = escapeshellarg($bin);
         foreach ($args as $a) {
-            $cmd .= ' ' . escapeshellarg($a);
+            $cmd .= ' '.escapeshellarg($a);
         }
-        $cmd .= ' > ' . escapeshellarg($outFile) . ' 2> ' . escapeshellarg($outFile . '.err');
+        $cmd .= ' > '.escapeshellarg($outFile).' 2> '.escapeshellarg($outFile.'.err');
 
         $this->withEnv('MYSQL_PWD', $c['pass'], function () use ($cmd, $outFile) {
-            $exit = 0; $out = [];
+            $exit = 0;
+            $out = [];
             exec($cmd, $out, $exit);
             if ($exit !== 0) {
-                $err = @file_get_contents($outFile . '.err') ?: '';
-                throw new RuntimeException("mysqldump failed (exit {$exit}): " . trim($err));
+                $err = @file_get_contents($outFile.'.err') ?: '';
+                throw new RuntimeException("mysqldump failed (exit {$exit}): ".trim($err));
             }
-            @unlink($outFile . '.err');
+            @unlink($outFile.'.err');
         });
     }
 
@@ -376,15 +450,15 @@ class DatabaseSyncService
         $host = escapeshellarg($c['host']);
         $port = escapeshellarg($c['port']);
         $user = escapeshellarg($c['user']);
-        $db   = escapeshellarg($c['db']);
+        $db = escapeshellarg($c['db']);
         $pass = escapeshellarg($c['pass']);
         $file = escapeshellarg($remoteFile);
 
         $cmd =
-            "( echo 'SET FOREIGN_KEY_CHECKS=0;'; cat {$file}; echo 'SET FOREIGN_KEY_CHECKS=1;' ) | " .
-            "MYSQL_PWD={$pass} mysql " .
-            "--host={$host} --port={$port} --user={$user} " .
-            "--default-character-set=utf8mb4 {$db} 2>&1; " .
+            "( echo 'SET FOREIGN_KEY_CHECKS=0;'; cat {$file}; echo 'SET FOREIGN_KEY_CHECKS=1;' ) | ".
+            "MYSQL_PWD={$pass} mysql ".
+            "--host={$host} --port={$port} --user={$user} ".
+            "--default-character-set=utf8mb4 {$db} 2>&1; ".
             "EXIT_CODE=\$?; rm -f {$file}; echo \"DBPUSH_EXIT:\$EXIT_CODE\"";
 
         $result = $ssh->exec($cmd);
@@ -392,7 +466,7 @@ class DatabaseSyncService
 
         if ($exit !== 0) {
             $body = preg_replace('/DBPUSH_EXIT:\d+\s*$/', '', $result['output']);
-            throw new RuntimeException('Remote mysql import failed: ' . trim($body));
+            throw new RuntimeException('Remote mysql import failed: '.trim($body));
         }
     }
 
@@ -400,14 +474,14 @@ class DatabaseSyncService
 
     private function dumpLocalPgsql(array $c, string $outFile): void
     {
-        $bin  = config('autopilot.pgsql.dump_binary', 'pg_dump');
+        $bin = config('autopilot.pgsql.dump_binary', 'pg_dump');
         $skip = (array) config('autopilot.pgsql.skip_tables', []);
 
         $args = [
-            '--host=' . $c['host'],
-            '--port=' . $c['port'],
-            '--username=' . $c['user'],
-            '--dbname=' . $c['db'],
+            '--host='.$c['host'],
+            '--port='.$c['port'],
+            '--username='.$c['user'],
+            '--dbname='.$c['db'],
             '--clean',           // DROP before CREATE — clears existing data/schema
             '--if-exists',       // don't error if objects don't exist yet
             '--no-owner',
@@ -416,23 +490,24 @@ class DatabaseSyncService
             '--encoding=UTF8',
         ];
         foreach ($skip as $t) {
-            $args[] = '--exclude-table-data=' . $t;
+            $args[] = '--exclude-table-data='.$t;
         }
 
         $cmd = escapeshellarg($bin);
         foreach ($args as $a) {
-            $cmd .= ' ' . escapeshellarg($a);
+            $cmd .= ' '.escapeshellarg($a);
         }
-        $cmd .= ' > ' . escapeshellarg($outFile) . ' 2> ' . escapeshellarg($outFile . '.err');
+        $cmd .= ' > '.escapeshellarg($outFile).' 2> '.escapeshellarg($outFile.'.err');
 
         $this->withEnv('PGPASSWORD', $c['pass'], function () use ($cmd, $outFile) {
-            $exit = 0; $out = [];
+            $exit = 0;
+            $out = [];
             exec($cmd, $out, $exit);
             if ($exit !== 0) {
-                $err = @file_get_contents($outFile . '.err') ?: '';
-                throw new RuntimeException("pg_dump failed (exit {$exit}): " . trim($err));
+                $err = @file_get_contents($outFile.'.err') ?: '';
+                throw new RuntimeException("pg_dump failed (exit {$exit}): ".trim($err));
             }
-            @unlink($outFile . '.err');
+            @unlink($outFile.'.err');
         });
 
         $this->stripUnportableExtensions($outFile);
@@ -460,7 +535,7 @@ class DatabaseSyncService
             return;
         }
 
-        $tmp = $file . '.filtered';
+        $tmp = $file.'.filtered';
         $out = fopen($tmp, 'w');
 
         // Index of the embedding field inside the COPY block currently being read,
@@ -484,17 +559,19 @@ class DatabaseSyncService
                     $dropField = null;
                     $emit($prev);
                     $prev = $line;
+
                     continue;
                 }
 
-                $eol    = str_ends_with($line, "\r\n") ? "\r\n" : "\n";
+                $eol = str_ends_with($line, "\r\n") ? "\r\n" : "\n";
                 $fields = explode("\t", rtrim($line, "\r\n"));
                 if (count($fields) > $dropField) {
                     array_splice($fields, $dropField, 1);
                 }
 
                 $emit($prev);
-                $prev = implode("\t", $fields) . $eol;
+                $prev = implode("\t", $fields).$eol;
+
                 continue;
             }
 
@@ -502,13 +579,13 @@ class DatabaseSyncService
             // which field position to strip from the rows that follow.
             if (preg_match('/^COPY\s+\S+\s*\(([^)]*)\)\s+FROM stdin;/i', $line, $m)) {
                 $cols = array_map('trim', explode(',', $m[1]));
-                $idx  = array_search('embedding', $cols, true);
+                $idx = array_search('embedding', $cols, true);
                 if ($idx !== false) {
                     $dropField = $idx;
                     unset($cols[$idx]);
                     $line = preg_replace(
                         '/\(([^)]*)\)/',
-                        '(' . implode(', ', $cols) . ')',
+                        '('.implode(', ', $cols).')',
                         $line,
                         1
                     );
@@ -549,7 +626,7 @@ class DatabaseSyncService
         fclose($in);
         fclose($out);
 
-        if (!@rename($tmp, $file)) {
+        if (! @rename($tmp, $file)) {
             @unlink($tmp);
             throw new RuntimeException("Could not replace dump with its filtered copy: {$file}");
         }
@@ -560,7 +637,7 @@ class DatabaseSyncService
         $host = escapeshellarg($c['host']);
         $port = escapeshellarg($c['port']);
         $user = escapeshellarg($c['user']);
-        $db   = escapeshellarg($c['db']);
+        $db = escapeshellarg($c['db']);
         $pass = escapeshellarg($c['pass']);
         $file = escapeshellarg($remoteFile);
 
@@ -570,13 +647,13 @@ class DatabaseSyncService
         // statements in correct FK dependency order — no truncate or constraint
         // deferral needed.
         $cmd =
-            "PGPASSWORD={$pass} {$psqlBin} " .
-            "--host={$host} --port={$port} --username={$user} --dbname={$db} " .
+            "PGPASSWORD={$pass} {$psqlBin} ".
+            "--host={$host} --port={$port} --username={$user} --dbname={$db} ".
             // -o /dev/null discards RESULT ROWS, not errors. Without it the tail of
             // a restore emits a setval table per sequence — dozens of them — which
             // buried the DBPUSH_EXIT marker below and made a successful import look
             // like a failure. Errors still arrive via stderr through 2>&1.
-            "-v ON_ERROR_STOP=1 --no-psqlrc --quiet -o /dev/null -f {$file} 2>&1; " .
+            "-v ON_ERROR_STOP=1 --no-psqlrc --quiet -o /dev/null -f {$file} 2>&1; ".
             "EXIT_CODE=\$?; rm -f {$file}; echo \"DBPUSH_EXIT:\$EXIT_CODE\"";
 
         $result = $ssh->exec($cmd);
@@ -584,18 +661,18 @@ class DatabaseSyncService
         // A missing marker means the exit status never came back — treat it as a
         // failure, but say so plainly rather than reporting a psql error that may
         // not have happened.
-        if (!preg_match('/DBPUSH_EXIT:(\d+)/', $result['output'] ?? '', $m)) {
+        if (! preg_match('/DBPUSH_EXIT:(\d+)/', $result['output'] ?? '', $m)) {
             throw new RuntimeException(
                 'Remote psql import returned no exit status; the database may or may '
-                . 'not have been written. Output tail: '
-                . trim(substr($result['output'] ?? '', -500))
+                .'not have been written. Output tail: '
+                .trim(substr($result['output'] ?? '', -500))
             );
         }
         $exit = (int) $m[1];
 
         if ($exit !== 0) {
             $body = preg_replace('/DBPUSH_EXIT:\d+\s*$/', '', $result['output']);
-            throw new RuntimeException('Remote psql import failed: ' . trim($body));
+            throw new RuntimeException('Remote psql import failed: '.trim($body));
         }
     }
 
@@ -605,10 +682,10 @@ class DatabaseSyncService
      */
     private function withEnv(string $name, string $value, callable $fn): void
     {
-        $prev    = getenv($name);
+        $prev = getenv($name);
         $hadPrev = $prev !== false;
         if ($value !== '') {
-            putenv($name . '=' . $value);
+            putenv($name.'='.$value);
         } else {
             putenv($name);
         }
@@ -616,7 +693,7 @@ class DatabaseSyncService
             $fn();
         } finally {
             if ($hadPrev) {
-                putenv($name . '=' . $prev);
+                putenv($name.'='.$prev);
             } else {
                 putenv($name);
             }

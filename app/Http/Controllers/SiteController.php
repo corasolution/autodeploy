@@ -15,7 +15,7 @@ class SiteController extends Controller
     private function authorizeServer(Server $server): void
     {
         $user = auth()->user();
-        if (!$user->isAdmin() && $server->user_id !== $user->id) {
+        if (! $user->isAdmin() && $server->user_id !== $user->id) {
             abort(403);
         }
     }
@@ -28,6 +28,7 @@ class SiteController extends Controller
     public function create(Server $server): Response
     {
         $this->authorizeServer($server);
+
         return Inertia::render('Sites/Create', ['server' => $server]);
     }
 
@@ -35,22 +36,23 @@ class SiteController extends Controller
     {
         $this->authorizeServer($server);
         $data = $request->validate([
-            'name'                  => 'required|string|max:100',
-            'deploy_path'           => 'required|string|max:500',
-            'source_path'           => 'nullable|string|max:500',
-            'repo_url'              => 'nullable|string|max:500',
-            'branch'                => 'string|max:100',
-            'run_seeders'           => 'boolean',
+            'name' => 'required|string|max:100',
+            'deploy_path' => 'required|string|max:500',
+            'source_path' => 'nullable|string|max:500',
+            'repo_url' => 'nullable|string|max:500',
+            'branch' => 'string|max:100',
+            'run_seeders' => 'boolean',
             'run_tenant_migrations' => 'boolean',
-            'grant_createdb'        => 'boolean',
-            'pre_migrate_commands'  => 'nullable|string',
-            'php_binary'            => 'string|max:200',
-            'app_url'               => 'nullable|url',
-            'env_content'           => 'nullable|string',
-            'active'                => 'boolean',
+            'grant_createdb' => 'boolean',
+            'pre_migrate_commands' => 'nullable|string',
+            'php_binary' => 'string|max:200',
+            'app_url' => 'nullable|url',
+            'env_content' => 'nullable|string',
+            'active' => 'boolean',
+            'environment' => 'sometimes|in:production,staging,local',
         ]);
 
-        if (!empty($data['source_path']) && !empty($data['repo_url'])) {
+        if (! empty($data['source_path']) && ! empty($data['repo_url'])) {
             throw ValidationException::withMessages([
                 'repo_url' => 'You cannot set both Source Path and Repo URL. Use one or the other.',
             ]);
@@ -73,22 +75,23 @@ class SiteController extends Controller
     {
         $this->authorizeSite($site);
         $data = $request->validate([
-            'name'                  => 'required|string|max:100',
-            'deploy_path'           => 'required|string|max:500',
-            'source_path'           => 'nullable|string|max:500',
-            'repo_url'              => 'nullable|string|max:500',
-            'branch'                => 'string|max:100',
-            'run_seeders'           => 'boolean',
+            'name' => 'required|string|max:100',
+            'deploy_path' => 'required|string|max:500',
+            'source_path' => 'nullable|string|max:500',
+            'repo_url' => 'nullable|string|max:500',
+            'branch' => 'string|max:100',
+            'run_seeders' => 'boolean',
             'run_tenant_migrations' => 'boolean',
-            'grant_createdb'        => 'boolean',
-            'pre_migrate_commands'  => 'nullable|string',
-            'php_binary'            => 'string|max:200',
-            'app_url'               => 'nullable|url',
-            'env_content'           => 'nullable|string',
-            'active'                => 'boolean',
+            'grant_createdb' => 'boolean',
+            'pre_migrate_commands' => 'nullable|string',
+            'php_binary' => 'string|max:200',
+            'app_url' => 'nullable|url',
+            'env_content' => 'nullable|string',
+            'active' => 'boolean',
+            'environment' => 'sometimes|in:production,staging,local',
         ]);
 
-        if (!empty($data['source_path']) && !empty($data['repo_url'])) {
+        if (! empty($data['source_path']) && ! empty($data['repo_url'])) {
             throw ValidationException::withMessages([
                 'repo_url' => 'You cannot set both Source Path and Repo URL. Use one or the other.',
             ]);

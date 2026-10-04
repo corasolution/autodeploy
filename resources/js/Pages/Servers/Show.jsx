@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Layout, { StatusBadge, IconServer, IconRocket, IconPlay, IconPlus, IconEdit, IconTrash, IconDatabase, IconGitBranch, IconExternal, IconCheck, IconX, IconWarning } from '../../Components/Layout';
 import { Link, router } from '@inertiajs/react';
 
@@ -18,10 +18,23 @@ const STATUS_LABEL = {
 // ─── Confirm Modal ────────────────────────────────────────────────────────────
 
 function ConfirmModal({ action, onConfirm, onCancel }) {
+    const [typedName, setTypedName] = useState('');
+
+    // Clear the confirmation box whenever a different action opens the modal,
+    // so a previously-typed name can't carry over into the next push.
+    useEffect(() => { setTypedName(''); }, [action?.type, action?.site?.id]);
+
     if (!action) return null;
 
     const isDeploy = action.type !== 'delete';
     const isWarning = action.type === 'withDatabase';
+
+    // Pushing a local DB over a production site overwrites live rows, so the
+    // server requires the site name back (see DeployController::trigger). Mirror
+    // that here rather than letting the request fail validation.
+    const needsNameConfirm = isWarning && action.site?.environment !== 'staging'
+        && action.site?.environment !== 'local';
+    const nameConfirmed = !needsNameConfirm || typedName === action.site?.name;
 
     const iconBg   = isDeploy ? 'bg-orange-50'   : 'bg-red-50';
     const iconColor = isDeploy ? 'text-orange-500' : 'text-red-500';
@@ -85,7 +98,24 @@ function ConfirmModal({ action, onConfirm, onCancel }) {
                             <IconWarning className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
                             <p className="text-xs text-amber-700">
                                 This will overwrite remote database rows with your local data.
+                                A backup of the remote database is taken first.
                             </p>
+                        </div>
+                    )}
+
+                    {/* Type-to-confirm for production DB pushes */}
+                    {needsNameConfirm && (
+                        <div className="mb-5">
+                            <label className="block text-xs font-medium text-slate-600 mb-1.5">
+                                Type <span className="font-mono font-semibold text-slate-900">{action.site.name}</span> to confirm
+                            </label>
+                            <input
+                                autoFocus
+                                value={typedName}
+                                onChange={(e) => setTypedName(e.target.value)}
+                                placeholder={action.site.name}
+                                className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-orange-400 focus:border-orange-400"
+                            />
                         </div>
                     )}
 
@@ -98,8 +128,9 @@ function ConfirmModal({ action, onConfirm, onCancel }) {
                             Cancel
                         </button>
                         <button
-                            onClick={onConfirm}
-                            className={`flex-1 px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors ${btnClass}`}
+                            onClick={() => onConfirm(typedName)}
+                            disabled={!nameConfirmed}
+                            className={`flex-1 px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors ${btnClass} disabled:opacity-40 disabled:cursor-not-allowed`}
                         >
                             {isDeploy ? 'Deploy' : 'Remove'}
                         </button>
@@ -150,13 +181,15 @@ export default function ServerShow({ server }) {
         setPendingAction({ type, label, description, site, server: server.name, withData, withDatabase });
     };
 
-    const confirmDeploy = () => {
+    const confirmDeploy = (typedName = '') => {
         if (!pendingAction) return;
         setDeploying(pendingAction.site.id);
         router.post('/deploy', {
             site_id: pendingAction.site.id,
             with_data: pendingAction.withData,
             with_database: pendingAction.withDatabase,
+            // Only meaningful for production DB pushes; the server re-checks it.
+            confirm_site_name: typedName,
         }, { onFinish: () => setDeploying(null) });
         setPendingAction(null);
     };
@@ -176,9 +209,9 @@ export default function ServerShow({ server }) {
         setPendingAction(null);
     };
 
-    const handleConfirm = () => {
+    const handleConfirm = (typedName) => {
         if (pendingAction?.type === 'delete') confirmDelete();
-        else confirmDeploy();
+        else confirmDeploy(typedName);
     };
 
     const panelLabel = server.panel_type === 'cpanel' ? 'cPanel' : 'aaPanel';

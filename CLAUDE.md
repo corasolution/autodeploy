@@ -4,6 +4,9 @@
 > This file governs how Claude Code operates inside this project.
 > Claude Code must read this file fully before executing any task.
 
+**Active work: implement `docs/UPGRADE-v2.md` phase by phase. Do not start a
+phase until the previous one's acceptance tests pass.**
+
 ---
 
 ## 🧭 Project Overview
