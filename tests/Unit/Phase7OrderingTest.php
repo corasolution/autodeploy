@@ -308,4 +308,114 @@ class Phase7OrderingTest extends TestCase
 
         $this->assertSame([], $this->invokePrivate($service, 'pendingMigrations', ['/www/wwwroot/p7/releases/1']));
     }
+    // ── Phase 7 follow-up: maintenance window vs the audit gate ──────────────
+
+    /**
+     * An atomic site with maintenance_on_migrate must NOT go down in phase 4a.
+     *
+     * The risk audit runs between 4a and 4b and returns early when it holds a
+     * deploy — a path that never reaches `artisan up`. Taking the site down
+     * before that gate left it stranded on the 503 page until someone approved.
+     */
+    public function test_atomic_maintenance_site_held_by_audit_is_never_taken_down(): void
+    {
+        $ssh = $this->fakeSsh();
+        $deployment = $this->makeDeployment([
+            'release_mode' => 'atomic',
+            'maintenance_on_migrate' => true,
+        ]);
+
+        $claude = $this->createMock(ClaudeAgentService::class);
+        $claude->method('auditConfig')->willReturn([
+            'risk_level' => 'high',
+            'warnings' => ['drops a column'],
+            'suggestions' => [],
+        ]);
+
+        $service = new DeployService($claude, $this->createMock(RollbackService::class));
+        foreach ([
+            'deployment' => $deployment,
+            'site' => $deployment->site,
+            'server' => $deployment->server,
+            'ssh' => $ssh,
+            'releasePath' => '/www/wwwroot/p7/releases/'.$deployment->id,
+        ] as $prop => $value) {
+            (new \ReflectionProperty($service, $prop))->setValue($service, $value);
+        }
+
+        $this->invokePrivate($service, 'phase4RemoteCommands');
+
+        $held = $this->invokePrivate($service, 'auditRequiresApproval');
+
+        $this->assertTrue($held, 'A high risk_level must hold the deploy');
+        $this->assertSame('awaiting_approval', $deployment->fresh()->status);
+
+        $this->assertNull(
+            $this->indexOf($ssh->executed, 'artisan down'),
+            'The live site must not be taken down before the audit gate — that path never reaches artisan up'
+        );
+
+        // And the flag that would make run()'s catch lift maintenance is still off.
+        $this->assertFalse(
+            (new \ReflectionProperty($service, 'maintenanceOn'))->getValue($service)
+        );
+    }
+
+    /** Once past the gate, the window does open. */
+    public function test_atomic_maintenance_site_goes_down_in_phase4_migrate(): void
+    {
+        $ssh = $this->fakeSsh();
+        $deployment = $this->makeDeployment([
+            'release_mode' => 'atomic',
+            'maintenance_on_migrate' => true,
+        ]);
+        $service = $this->service($deployment, $ssh, '/www/wwwroot/p7/releases/1');
+
+        $this->invokePrivate($service, 'phase4Migrate');
+
+        $down = $this->indexOf($ssh->executed, 'artisan down');
+        $migrate = $this->indexOf($ssh->executed, 'migrate --force');
+
+        $this->assertNotNull($down, 'maintenance_on_migrate must still take the site down');
+        $this->assertTrue($down < $migrate, 'down must precede migrate');
+
+        // And the window closes again within the same phase: step 23 runs at the
+        // end, which is also what clears the maintenanceOn flag.
+        $up = $this->indexOf($ssh->executed, 'artisan up');
+        $this->assertNotNull($up, 'the window must be closed before phase 4b returns');
+        $this->assertTrue($migrate < $up);
+        $this->assertFalse(
+            (new \ReflectionProperty($service, 'maintenanceOn'))->getValue($service),
+            'flag is cleared once the site is back up, so the catch has nothing to lift'
+        );
+    }
+
+    /** Atomic without the flag stays up throughout — the old release serves traffic. */
+    public function test_atomic_without_the_flag_never_goes_down(): void
+    {
+        $ssh = $this->fakeSsh();
+        $deployment = $this->makeDeployment([
+            'release_mode' => 'atomic',
+            'maintenance_on_migrate' => false,
+        ]);
+        $service = $this->service($deployment, $ssh, '/www/wwwroot/p7/releases/1');
+
+        $this->invokePrivate($service, 'phase4RemoteCommands');
+        $this->invokePrivate($service, 'phase4Migrate');
+
+        $this->assertNull($this->indexOf($ssh->executed, 'artisan down'));
+    }
+
+    /** in_place is unchanged: it still goes down inside phase 4a. */
+    public function test_in_place_still_goes_down_in_phase4a(): void
+    {
+        $ssh = $this->fakeSsh();
+        $deployment = $this->makeDeployment(['release_mode' => 'in_place']);
+        $service = $this->service($deployment, $ssh);
+
+        $this->invokePrivate($service, 'phase4RemoteCommands');
+
+        $this->assertNotNull($this->indexOf($ssh->executed, 'artisan down'));
+        $this->assertTrue((new \ReflectionProperty($service, 'maintenanceOn'))->getValue($service));
+    }
 }

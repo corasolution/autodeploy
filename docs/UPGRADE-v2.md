@@ -220,3 +220,18 @@ while billing is unresolved.
 **Action required:** add credit to the Anthropic account. Until then the AI
 layer returns fallbacks — now logged and surfaced in the UI rather than
 silent. Model ids are left at `claude-sonnet-5` / `claude-haiku-4-5-20251001`.
+
+### Phase 7 follow-up — maintenance window vs the audit gate
+
+Found after Phase 7 landed. On an atomic site with `maintenance_on_migrate`,
+`artisan down` was issued in phase 4a, i.e. **before** the risk audit. When the
+audit held the deploy, `run()` returned early — a path that never reaches
+`artisan up` — so the live site stayed on the 503 page until somebody
+approved.
+
+Fixed by not adding step 15 to the phase 4a command set for atomic sites and
+issuing it at the start of `phase4Migrate()` instead, past the gate. The
+window therefore opens only once the deploy is certain to proceed, and
+`maintenanceOn` is set only once the site is actually down, so `run()`'s catch
+is never responsible for a window that was never opened. `in_place` is
+unchanged — it has no audit gate between phases and still goes down in 4a.

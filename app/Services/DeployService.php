@@ -914,13 +914,17 @@ class DeployService
         // loads that manifest and dies with "Class ... ServiceProvider not found"
         // before it can clear anything. Deleting the compiled files directly (no
         // framework boot) lets the app boot fresh and regenerate the manifest.
+        $isAtomic = $this->site->isAtomic();
+
         // Atomic deploys build a release the live site isn't serving yet, so
         // there is nothing to take down — the old release keeps answering until
-        // the symlink flips. Sites with destructive migrations can opt back in
-        // via maintenance_on_migrate.
-        $useMaintenance = ! $this->site->isAtomic() || $this->site->maintenance_on_migrate;
-
-        $isAtomic = $this->site->isAtomic();
+        // the symlink flips. Sites with destructive migrations opt back in via
+        // maintenance_on_migrate, but even then the window must not open here:
+        // the risk audit runs between phase 4a and 4b and can return without
+        // reaching `artisan up`, which would strand the live site on the 503
+        // page until somebody approved. Atomic sites go down at the start of
+        // phase4Migrate() instead, past that gate.
+        $useMaintenance = ! $isAtomic;
 
         // R3: composer must be able to FAIL. The old pipeline ended in
         // `| grep -v … || true`, so a failed install exited 0 and a release with
@@ -1028,6 +1032,31 @@ class DeployService
     {
         $path = escapeshellarg($this->targetPath());
         $php = escapeshellarg($this->site->php_binary ?: 'php');
+
+        // Step 15 for atomic sites that asked for a maintenance window. It runs
+        // here, not in phase 4a, so the window opens only once the deploy is
+        // certain to proceed: the risk audit sits between the two phases and can
+        // return early, and that path never reaches `artisan up` — which left the
+        // live site stranded on the 503 page until someone approved.
+        //
+        // storage/ is shared on atomic sites, so the down file written from the
+        // release is seen by the release currently serving traffic.
+        if ($this->site->isAtomic() && $this->site->maintenance_on_migrate) {
+            $downToken = bin2hex(random_bytes(16));
+            $downCmd = "cd {$path} && {$php} artisan down --retry=60 --secret={$downToken} 2>&1";
+
+            $downResult = $this->ssh->exec($downCmd);
+            $downExit = $downResult['exit_code'] ?? 1;
+
+            $this->log(4, 15, $downExit === 0 ? 'success' : 'error', $downCmd,
+                $this->filterNoise($downResult['output'] ?? ''), $downExit);
+
+            // Only once the site is actually down does run()'s catch become
+            // responsible for lifting it.
+            if ($downExit === 0) {
+                $this->maintenanceOn = true;
+            }
+        }
 
         // Optional: pre-migrate commands (one per line, e.g. "php artisan tenancy:install").
         // Run before migrate --force so setup commands (publishing migrations, etc.) complete first.
