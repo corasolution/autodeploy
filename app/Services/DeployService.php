@@ -1,0 +1,938 @@
+<?php
+
+namespace App\Services;
+
+use App\Events\DeploymentPhaseCompleted;
+use App\Models\Deployment;
+use App\Models\DeployLog;
+use App\Models\Server;
+use App\Models\Site;
+use Illuminate\Support\Facades\Http;
+use RuntimeException;
+
+class DeployService
+{
+    private SshService $ssh;
+    private ClaudeAgentService $claude;
+    private RollbackService $rollback;
+    private Deployment $deployment;
+    private Server $server;
+    private Site $site;
+    private ?string $gitTempPath = null;
+
+    /**
+     * Resolve the local composer command. On Windows (Laragon) `composer` may
+     * not be in PATH when running from a queue worker, so we fall back to
+     * invoking composer.phar directly via the current PHP binary.
+     */
+    private function getComposerCommand(): string
+    {
+        // Check if composer is directly callable
+        $check = shell_exec('composer --version 2>&1');
+        if ($check && str_contains($check, 'Composer version')) {
+            return 'composer';
+        }
+
+        // Laragon: use php + composer.phar
+        $pharPaths = [
+            'C:\\laragon\\bin\\composer\\composer.phar',
+            'C:\\laragon\\bin\\composer.phar',
+        ];
+        foreach ($pharPaths as $phar) {
+            if (file_exists($phar)) {
+                return escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($phar);
+            }
+        }
+
+        // Last resort — hope it's in PATH
+        return 'composer';
+    }
+
+    public function __construct(
+        ClaudeAgentService $claude,
+        RollbackService $rollback
+    ) {
+        $this->claude   = $claude;
+        $this->rollback = $rollback;
+    }
+
+    public function run(Deployment $deployment): void
+    {
+        $this->deployment = $deployment;
+        $this->site       = $deployment->site;
+        $this->server     = $deployment->server ?? $this->site->server;
+        $this->ssh        = new SshService($this->server);
+
+        $deployment->markStarted();
+
+        try {
+            $this->phase1PreFlight();
+
+            // Three deploy modes:
+            // Mode B: source_path set → build from local folder, zip, upload
+            // Mode C: repo_url set   → clone from git, build, zip, upload
+            // Mode A: neither set    → remote commands only (code already on server)
+            if ($this->site->source_path) {
+                $this->phase2BuildAssets();
+                $this->phase3Upload();
+            } elseif ($this->site->repo_url) {
+                $this->phase2CloneAndBuild();
+                $this->phase3Upload();
+            } else {
+                $this->log(2, 7, 'info', null,
+                    'Phase 2 & 3 skipped — no source_path or repo_url set. ' .
+                    'Running remote commands only on existing server code.');
+            }
+
+            $this->phase4RemoteCommands();
+
+            $healthy = $this->phase5HealthCheck();
+
+            if (!$healthy) {
+                $lastErrorLog = $this->getRemoteErrorLog();
+                $this->phase6Rollback($lastErrorLog);
+            } else {
+                $deployment->markFinished('success');
+            }
+        } catch (\Throwable $e) {
+            $this->log(0, 0, 'error', null, $e->getMessage());
+            $deployment->markFinished('failed');
+            throw $e;
+        } finally {
+            $this->ssh->disconnect();
+            $this->cleanupGitTemp();
+            $this->restoreLocalDevDeps();
+        }
+    }
+
+    /**
+     * Restore local dev dependencies after a Mode B build.
+     *
+     * Mode B runs `composer install --no-dev` directly in the user's source
+     * folder to produce a production vendor/ for the zip. That strips dev-only
+     * packages (collision, phpunit, …) and breaks the developer's local
+     * `artisan serve` with "CollisionServiceProvider not found". Re-install with
+     * dev deps so their working copy keeps running. Runs in finally (so it also
+     * restores after a failed deploy) and is best-effort — never fails a deploy.
+     * Guarded to Mode B: source_path must be set (skips Mode A and temp clones).
+     */
+    private function restoreLocalDevDeps(): void
+    {
+        // vendor/ is no longer built locally — composer install runs on the server
+        // in Phase 4. Nothing to restore.
+    }
+
+    // --- Phase 1 ---
+    private function phase1PreFlight(): void
+    {
+        $this->log(1, 1, 'info', null, 'Phase 1: Pre-flight checks');
+
+        // Step 1: Validate server profile
+        if (empty($this->server->host) || empty($this->server->ssh_user)) {
+            throw new RuntimeException('Invalid server profile: missing host or SSH user.');
+        }
+        $this->log(1, 1, 'success', null, 'Server profile valid');
+
+        // Step 2: Test SSH
+        $this->ssh->connect();
+        $this->log(1, 2, 'success', null, 'SSH connected to ' . $this->server->host);
+
+        // Step 3: Check disk space
+        $freeMb = $this->ssh->getDiskFreeSpace($this->site->deploy_path);
+        $minMb  = config('autopilot.deploy.disk_warning_mb', 500);
+        $status = $freeMb >= $minMb ? 'success' : 'warning';
+        $this->log(1, 3, $status, null, "Disk free: {$freeMb}MB (minimum {$minMb}MB)");
+
+        // Step 4: Check PHP version
+        $phpVersion = $this->ssh->getPhpVersion();
+        $minPhp     = config('autopilot.deploy.min_php_version', '8.2');
+        $phpOk      = version_compare($phpVersion, $minPhp, '>=');
+        $this->log(1, 4, $phpOk ? 'success' : 'warning', null, "PHP: {$phpVersion}");
+
+        // Step 5: Check MySQL
+        $result = $this->ssh->exec('mysql --version 2>&1');
+        $this->log(1, 5, str_contains($result['output'], 'mysql') ? 'success' : 'warning',
+            'mysql --version', $result['output']);
+
+        // Step 6: Snapshot current state
+        $result = $this->ssh->exec('cd ' . escapeshellarg($this->site->deploy_path) . ' && git rev-parse HEAD 2>/dev/null || echo "no-git"');
+        $this->log(1, 6, 'info', 'git rev-parse HEAD', trim($result['output']));
+
+        $this->broadcastPhase(1, 'Pre-flight complete');
+    }
+
+    // --- Phase 2 ---
+    private function phase2BuildAssets(): void
+    {
+        $this->log(2, 7, 'info', null, 'Phase 2: Building assets locally');
+
+        $base = $this->getSourcePath();
+        $this->log(2, 7, 'info', null, 'Building from source: ' . $base);
+
+        // Step 7: npm run build
+        $output = shell_exec("cd " . escapeshellarg($base) . " && npm run build 2>&1");
+        $this->log(2, 7, 'success', 'npm run build', $output);
+
+        // Step 8: vendor/ is excluded from the zip and installed on the server
+        // in Phase 4 (composer install --no-dev). Skip local composer install
+        // to avoid stripping dev deps from the developer's working copy.
+        $this->log(2, 8, 'success', null, 'Skipping local composer install — vendor/ installed on server in Phase 4.');
+
+        // Step 9: Verify build output (only if project has a public/build/ target)
+        $buildPath = $base . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR . 'build';
+        if (is_dir($buildPath) && count(scandir($buildPath)) > 2) {
+            $this->log(2, 9, 'success', null, 'Build assets verified at ' . $buildPath);
+        } else {
+            $this->log(2, 9, 'warning', null, 'No Vite build output found at ' . $buildPath . ' — continuing anyway');
+        }
+
+        $this->broadcastPhase(2, 'Assets built');
+    }
+
+    // --- Phase 2 (Mode C) ---
+    private function phase2CloneAndBuild(): void
+    {
+        $this->log(2, 7, 'info', null, 'Phase 2: Cloning repo and building assets');
+
+        // Verify git is available
+        $gitVersion = shell_exec('git --version 2>&1');
+        if (!$gitVersion || !str_contains($gitVersion, 'git version')) {
+            throw new RuntimeException('git is not installed on this machine. Install git to use repo-based deploys.');
+        }
+
+        $branch  = $this->site->branch ?: 'main';
+        $repoUrl = $this->site->repo_url;
+        $tempDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'autopilot_git_' . $this->deployment->id;
+
+        // Clean up any stale temp from a previous failed run
+        if (is_dir($tempDir)) {
+            $this->deleteDirectory($tempDir);
+        }
+        mkdir($tempDir, 0755, true);
+
+        // Clone (shallow — faster, less disk)
+        $cloneCmd = sprintf(
+            'git clone --depth 1 --branch %s %s %s 2>&1',
+            escapeshellarg($branch),
+            escapeshellarg($repoUrl),
+            escapeshellarg($tempDir)
+        );
+        $output = shell_exec($cloneCmd);
+        $this->log(2, 7, 'success', $cloneCmd, $output);
+
+        if (!is_dir($tempDir . DIRECTORY_SEPARATOR . '.git')) {
+            throw new RuntimeException("Git clone failed — .git directory not found in {$tempDir}");
+        }
+
+        $this->gitTempPath = $tempDir;
+
+        // npm install + build (cloned repo has no node_modules)
+        $output = shell_exec('cd ' . escapeshellarg($tempDir) . ' && npm install && npm run build 2>&1');
+        $this->log(2, 7, 'success', 'npm install && npm run build', $output);
+
+        // composer install (--no-scripts to avoid artisan package:discover DB errors)
+        $composerCmd = $this->getComposerCommand();
+        $output = shell_exec('cd ' . escapeshellarg($tempDir) . " && {$composerCmd} install --no-dev --no-scripts --optimize-autoloader --ignore-platform-req=ext-pcntl --ignore-platform-req=ext-posix 2>&1");
+        $this->log(2, 8, 'success', 'composer install --no-dev --no-scripts --optimize-autoloader --ignore-platform-req=ext-pcntl', $output);
+
+        // Verify build output
+        $buildPath = $tempDir . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR . 'build';
+        if (is_dir($buildPath) && count(scandir($buildPath)) > 2) {
+            $this->log(2, 9, 'success', null, 'Build assets verified at ' . $buildPath);
+        } else {
+            $this->log(2, 9, 'warning', null, 'No Vite build output found — continuing anyway');
+        }
+
+        $this->broadcastPhase(2, 'Repo cloned and assets built');
+    }
+
+    /**
+     * Absolute local path to the source code that should be zipped and deployed.
+     * Returns gitTempPath for Mode C, source_path for Mode B, or base_path() as fallback.
+     */
+    private function getSourcePath(): string
+    {
+        if ($this->gitTempPath) {
+            return $this->gitTempPath;
+        }
+
+        $path = $this->site->source_path ?: base_path();
+
+        if (!is_dir($path)) {
+            throw new RuntimeException(
+                "Source path does not exist: {$path}. " .
+                "Set 'Source Path' on the site to the local folder of the project you want to deploy."
+            );
+        }
+
+        return rtrim($path, '/\\');
+    }
+
+    private function cleanupGitTemp(): void
+    {
+        if ($this->gitTempPath && is_dir($this->gitTempPath)) {
+            $this->deleteDirectory($this->gitTempPath);
+            $this->gitTempPath = null;
+        }
+    }
+
+    private function deleteDirectory(string $dir): void
+    {
+        $items = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+        foreach ($items as $item) {
+            $item->isDir() ? rmdir($item->getRealPath()) : unlink($item->getRealPath());
+        }
+        rmdir($dir);
+    }
+
+    // --- Phase 3 ---
+    private function phase3Upload(): void
+    {
+        $this->log(3, 10, 'info', null, 'Phase 3: Uploading to server');
+
+        // Step 10: Build zip archive locally (no rsync — works on Windows + Linux)
+        $zipPath = storage_path('app/deploy_' . $this->deployment->id . '.zip');
+        $zipLog = DeployLog::record($this->deployment->id, 3, 10, 'info', null, 'Creating archive (0%)...');
+        $this->createZipArchive($zipPath, function ($pct, $fileCount) use ($zipLog) {
+            $zipLog->forceFill([
+                'output'    => "Creating archive ({$pct}%) — {$fileCount} files processed",
+                'logged_at' => now(),
+            ])->save();
+        });
+        $size = round(filesize($zipPath) / 1024 / 1024, 1);
+        $zipLog->forceFill([
+            'status'    => 'success',
+            'output'    => "Archive created: {$size}MB",
+            'logged_at' => now(),
+        ])->save();
+
+        // Step 11: Upload via SFTP. We create a single "progress" log row up
+        // front and update its `output` in place on every progress tick so the
+        // live terminal shows real-time upload percentage instead of going
+        // silent for several minutes on slow links.
+        $remoteTmp = '/tmp/autopilot_deploy_' . $this->deployment->id . '.zip';
+        $progressLog = DeployLog::record(
+            $this->deployment->id, 3, 11, 'info', null,
+            "Uploading 0/{$size}MB (0%)..."
+        );
+        $onProgress = function ($sent, $total, $rateMbps, $pct) use ($progressLog) {
+            $sentMb  = round($sent / 1024 / 1024, 1);
+            $totalMb = $total > 0 ? round($total / 1024 / 1024, 1) : 0;
+            $progressLog->forceFill([
+                'output'    => "Uploading {$sentMb}/{$totalMb}MB ({$pct}%) at {$rateMbps} MB/s",
+                'logged_at' => now(),
+            ])->save();
+        };
+        $this->ssh->uploadFile($zipPath, $remoteTmp, $onProgress);
+        @unlink($zipPath);
+        $progressLog->forceFill([
+            'status'    => 'success',
+            'output'    => "Archive uploaded via SFTP ({$size}MB)",
+            'logged_at' => now(),
+        ])->save();
+
+        // Reconnect SSH to get a clean channel after SFTP
+        $this->ssh->reconnect();
+
+        // Step 12: Extract + cleanup in one single exec to avoid channel-reuse errors
+        $deployPath = $this->site->deploy_path;
+        $path      = escapeshellarg($deployPath);
+        $remoteTmpQ = escapeshellarg($remoteTmp);
+        // A non-root SSH user can't overwrite files the previous deploy handed to
+        // the web user (Step 13b / 235), so reclaim ownership first — needs the
+        // NOPASSWD chown/chmod sudoers rule (see asRoot()).
+        $reclaim = $this->server->ssh_user !== 'root'
+            ? 'sudo -n chown -R ' . escapeshellarg($this->server->ssh_user . ($this->webUser() ? ':' . $this->webUser() : '')) . " {$path} 2>/dev/null; "
+            : '';
+        $result = $this->ssh->exec(
+            "mkdir -p {$path} 2>/dev/null; {$reclaim}" .
+            "rm -rf {$deployPath}/vendor/laravel/pail {$deployPath}/vendor/laravel/telescope {$deployPath}/vendor/barryvdh/laravel-debugbar 2>/dev/null; " .
+            "unzip -oq {$remoteTmpQ} -d {$path} 2>&1 | tail -5; " .
+            "UNZIP_EXIT=\${PIPESTATUS[0]}; " .
+            "rm -f {$remoteTmpQ}; " .
+            "echo \"EXIT:\$UNZIP_EXIT\""
+        );
+        $exitCode = preg_match('/EXIT:(\d+)/', $result['output'] ?? '', $m) ? (int)$m[1] : 1;
+        $detail = $exitCode === 0 ? 'Extracted successfully' : 'Extract failed: ' . trim($result['output'] ?? '');
+        $this->log(3, 12, $exitCode === 0 ? 'success' : 'error', 'unzip', $detail, $exitCode);
+
+        if ($exitCode !== 0) {
+            throw new RuntimeException('Extract failed');
+        }
+
+        // Step 12b: Prune stale build assets.
+        //
+        // unzip -o overwrites and adds, but never deletes — so every deploy that
+        // rebuilds the frontend leaves the previous build's hashed files behind
+        // in public/build/assets, and the folder grows without bound. This keeps
+        // only the files the current manifest references and removes the rest.
+        //
+        // Deliberately conservative: it runs only when a non-empty manifest.json
+        // is present, and a file is deleted only when its basename appears in
+        // NEITHER manifest.json nor .vite/manifest.json — which, right after a
+        // fresh extract, is true only of assets from older builds. If anything
+        // looks off it deletes nothing and the deploy proceeds.
+        $buildDir = escapeshellarg($deployPath . '/public/build');
+        $prune = $this->ssh->exec(
+            "B={$buildDir}; " .
+            'A="$B/assets"; ' .
+            'M="$B/manifest.json"; V="$B/.vite/manifest.json"; ' .
+            'if [ -d "$A" ] && [ -s "$M" ]; then ' .
+            '  KEEP=$(grep -ohaE "assets/[A-Za-z0-9_.-]+" "$M" "$V" 2>/dev/null | sed "s#assets/##" | sort -u); ' .
+            '  if [ -n "$KEEP" ]; then ' .
+            '    removed=0; ' .
+            '    for f in "$A"/*; do [ -e "$f" ] || continue; b=$(basename "$f"); ' .
+            '      printf "%s\n" "$KEEP" | grep -qxF "$b" || { rm -f "$f"; removed=$((removed+1)); }; ' .
+            '    done; ' .
+            '    echo "PRUNED:$removed"; ' .
+            '  else echo "PRUNED:skip-no-refs"; fi; ' .
+            'else echo "PRUNED:skip-no-manifest"; fi'
+        );
+        $this->log(3, 12, 'success', 'prune stale build assets', trim($prune['output'] ?? ''));
+
+        // Reconnect before chmod (fresh channel)
+        $this->ssh->reconnect();
+
+        // Step 13: Ensure framework runtime dirs exist, then set permissions in one exec call
+        $writableDirs = config('autopilot.deploy.writable_dirs', []);
+        $ensureDirs = [
+            'storage/framework/cache/data',
+            'storage/framework/sessions',
+            'storage/framework/views',
+            'storage/logs',
+            'bootstrap/cache',
+        ];
+        $mkdirCmd = '';
+        foreach ($ensureDirs as $dir) {
+            $mkdirCmd .= "mkdir -p {$path}/" . escapeshellarg($dir) . " && ";
+        }
+        $chmodExtra = '';
+        foreach ($writableDirs as $dir) {
+            $chmodExtra .= " && chmod -R 775 {$path}/" . escapeshellarg($dir);
+        }
+        $this->ssh->exec(
+            $mkdirCmd .
+            "find {$path} -type d -exec chmod 755 {} \\; && " .
+            "find {$path} -type f -exec chmod 644 {} \\;" .
+            $chmodExtra
+        );
+        $this->log(3, 13, 'success', null, 'Runtime dirs ensured + permissions set (755/644, writable dirs 775)');
+
+        // Step 13b: chown so the web server (PHP-FPM) can write to storage/
+        // and bootstrap/cache/. Without this, Laravel silently fails on a
+        // freshly-uploaded root-owned deploy → blank page.
+        $webUser = $this->webUser();
+
+        if ($webUser) {
+            $this->ssh->reconnect();
+            // Phase 4 still writes .env and runs artisan as the SSH user, so a
+            // non-root deployer keeps ownership here (group = web user, dirs are
+            // group-writable); the final chown after artisan (step 235) hands
+            // everything to the web user.
+            $ownerUser = $this->server->ssh_user === 'root' ? $webUser : $this->server->ssh_user;
+            $owner = escapeshellarg($ownerUser . ':' . $webUser);
+            $this->ssh->exec($this->asRoot("chown -R {$owner} {$path}"));
+            $this->log(3, 13, 'success', null, "Ownership set to {$ownerUser}:{$webUser} on {$this->site->deploy_path}");
+        } else {
+            $this->log(3, 13, 'warning', null,
+                'No web_user configured on server — skipping chown. ' .
+                'Laravel may fail to write storage/ or bootstrap/cache/. ' .
+                'Edit the server and set "Web User" (aaPanel: www, cPanel/OpenPanel: your account user).');
+        }
+
+        // Step 13c: Sync storage/app/public/ (uploaded media) when deploying with
+        // +Data (seeders may reference seed images) OR +DB (the pushed database
+        // references uploaded files — they must ship together, or images 404).
+        // Kept separate from the main zip because this folder normally holds user
+        // uploads that must survive ordinary redeploys.
+        if ($this->deployment->with_data || $this->deployment->with_database) {
+            $this->syncStorageAppPublic($webUser);
+        }
+
+        $this->broadcastPhase(3, 'Upload complete');
+    }
+
+    /**
+     * OS user PHP-FPM runs as (aaPanel defaults to www).
+     */
+    private function webUser(): ?string
+    {
+        return $this->server->web_user
+            ?: ($this->server->panel_type === 'aapanel' ? 'www' : null);
+    }
+
+    /**
+     * Ownership/permission commands need root. When the SSH user is not root they
+     * go through passwordless sudo — the server needs a sudoers rule such as
+     *   deployuser ALL=(root) NOPASSWD: /usr/bin/chown, /usr/bin/chmod
+     */
+    private function asRoot(string $command): string
+    {
+        return $this->server->ssh_user === 'root' ? $command : "sudo -n {$command}";
+    }
+
+    private function syncStorageAppPublic(?string $webUser): void
+    {
+        $localDir = rtrim($this->getSourcePath(), '/\\') . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'app' . DIRECTORY_SEPARATOR . 'public';
+        if (!is_dir($localDir)) {
+            $this->log(3, 13, 'info', null, 'No local storage/app/public/ — skipping asset sync.');
+            return;
+        }
+
+        $assetZip = storage_path('app/tmp_assets_' . $this->deployment->id . '.zip');
+        @mkdir(dirname($assetZip), 0775, true);
+
+        $zip = new \ZipArchive();
+        if ($zip->open($assetZip, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
+            $this->log(3, 13, 'warning', null, 'Could not create asset zip — skipping.');
+            return;
+        }
+        $files = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($localDir, \RecursiveDirectoryIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::LEAVES_ONLY
+        );
+        $count = 0;
+        foreach ($files as $file) {
+            if (!$file->isFile()) continue;
+            $rel = str_replace('\\', '/', substr($file->getRealPath(), strlen($localDir) + 1));
+            if (str_starts_with($rel, 'livewire-tmp/')) continue;
+            $zip->addFile($file->getRealPath(), $rel);
+            $count++;
+        }
+        $zip->close();
+
+        if ($count === 0) {
+            @unlink($assetZip);
+            $this->log(3, 13, 'info', null, 'storage/app/public/ is empty — skipping asset sync.');
+            return;
+        }
+
+        $this->log(3, 13, 'info', null, "Uploading {$count} seed asset(s) from storage/app/public/");
+
+        // This upload opens a brand-new SFTP connection right after several rapid
+        // SSH reconnects (unzip/chmod/chown above). Some hosts briefly rate-limit
+        // new connections from the same IP in that situation — a short pause here
+        // avoids landing in that window (uploadFile() itself also retries/backs off).
+        usleep(500_000);
+
+        $remoteTmp = '/tmp/autopilot_assets_' . $this->deployment->id . '.zip';
+        $this->ssh->uploadFile($assetZip, $remoteTmp);
+        @unlink($assetZip);
+        $this->ssh->reconnect();
+
+        $remoteTarget = escapeshellarg($this->site->deploy_path . '/storage/app/public');
+        $remoteTmpQ   = escapeshellarg($remoteTmp);
+        $this->ssh->exec(
+            "mkdir -p {$remoteTarget} && " .
+            "unzip -oq {$remoteTmpQ} -d {$remoteTarget} > /dev/null 2>&1; " .
+            "rm -f {$remoteTmpQ}"
+        );
+
+        if ($webUser) {
+            $this->ssh->reconnect();
+            $owner = escapeshellarg($webUser . ':' . $webUser);
+            $this->ssh->exec($this->asRoot("chown -R {$owner} {$remoteTarget}") . ' && ' . $this->asRoot("chmod -R 775 {$remoteTarget}"));
+        }
+
+        $this->log(3, 13, 'success', null, "Synced {$count} file(s) to storage/app/public/");
+    }
+
+    private function createZipArchive(string $zipPath, ?callable $onProgress = null): void
+    {
+        $exclude = config('autopilot.deploy.excluded_paths', [
+            '.env', 'node_modules', '.git', 'storage/logs', 'tests',
+            // bootstrap/cache contains LOCAL Windows paths in services.php / packages.php.
+            // Shipping these to a Linux server breaks provider boot and package discovery.
+            'bootstrap/cache',
+            'storage/framework/cache',
+            'storage/framework/sessions',
+            'storage/framework/views',
+            'public/hot',
+            // vendor/ is excluded to keep the zip small for reliable upload over slow connections.
+            // composer install --no-dev runs on the server in Phase 4 instead.
+            'vendor',
+        ]);
+
+        $baseDir = $this->getSourcePath();
+        $zip     = new \ZipArchive();
+
+        if ($zip->open($zipPath, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
+            throw new RuntimeException('Cannot create zip archive at ' . $zipPath);
+        }
+
+        // Collect files first to know total count for progress
+        $allFiles = [];
+        $iter = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($baseDir, \RecursiveDirectoryIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::LEAVES_ONLY
+        );
+
+        foreach ($iter as $file) {
+            if (!$file->isFile()) continue;
+
+            $realPath     = $file->getRealPath();
+            $relativePath = str_replace('\\', '/', substr($realPath, strlen($baseDir) + 1));
+
+            $skip = false;
+            foreach ($exclude as $pattern) {
+                $pattern = ltrim(str_replace('\\', '/', $pattern), '/');
+                if (str_starts_with($relativePath, $pattern)) {
+                    $skip = true;
+                    break;
+                }
+            }
+            if (!$skip) {
+                $allFiles[] = [$realPath, $relativePath];
+            }
+        }
+
+        $total      = count($allFiles);
+        $lastPct    = -1;
+        $lastUpdate = 0;
+
+        foreach ($allFiles as $i => [$realPath, $relativePath]) {
+            $zip->addFile($realPath, $relativePath);
+
+            if ($onProgress && $total > 0) {
+                $pct = (int) round(($i + 1) * 100 / $total);
+                $now = time();
+                // Update every 2% or every 2 seconds
+                if ($pct >= $lastPct + 2 || $now > $lastUpdate + 2) {
+                    $onProgress($pct, $i + 1);
+                    $lastPct    = $pct;
+                    $lastUpdate = $now;
+                }
+            }
+        }
+
+        $zip->close();
+    }
+
+    // --- Phase 4 ---
+    private function phase4RemoteCommands(): void
+    {
+        $this->log(4, 14, 'info', null, 'Phase 4: Running remote commands');
+
+        // Write .env to remote server before any artisan commands
+        if ($this->site->env_content) {
+            $envPath = $this->site->deploy_path . '/.env';
+            $this->ssh->uploadContent($this->site->env_content, $envPath);
+            $this->log(4, 14, 'success', null, '.env written to ' . $envPath . ' (credentials masked)');
+        } else {
+            $this->log(4, 14, 'warning', null, 'No .env configured for this site — skipping .env write. Migrations may fail.');
+        }
+
+        // Reconnect SSH to get a fresh exec channel after SFTP uploadContent()
+        // (phpseclib SSH2 can fail with "Please close the channel" otherwise).
+        $this->ssh->reconnect();
+
+        // Optional: grant CREATEDB to the DB user so stancl/tenancy can auto-create
+        // tenant databases. Parses DB_USERNAME from the site's env_content.
+        // Only needs to run once but is safe to re-run (idempotent ALTER USER).
+        if ($this->site->grant_createdb && $this->site->env_content) {
+            $dbUser = null;
+            foreach (explode("\n", $this->site->env_content) as $line) {
+                $line = trim($line);
+                if (str_starts_with($line, 'DB_USERNAME=')) {
+                    $dbUser = trim(substr($line, strlen('DB_USERNAME=')), " \t\r\n\"'");
+                    break;
+                }
+            }
+
+            if ($dbUser) {
+                $safeUser = escapeshellarg($dbUser);
+                $grantCmd = "psql -U postgres -c \"ALTER USER {$safeUser} CREATEDB;\" 2>&1";
+                $grantResult = $this->ssh->exec($grantCmd);
+                $grantExit   = $grantResult['exit_code'] ?? 1;
+                $this->log(4, 14, $grantExit === 0 ? 'success' : 'warning',
+                    "psql -U postgres -c \"ALTER USER [DB_USERNAME] CREATEDB;\"",
+                    $grantResult['output'] ?? '', $grantExit);
+            } else {
+                $this->log(4, 14, 'warning', null, 'grant_createdb: could not parse DB_USERNAME from .env — skipping.');
+            }
+        }
+
+        $php  = escapeshellarg($this->site->php_binary);
+        $path = escapeshellarg($this->site->deploy_path);
+        $token = bin2hex(random_bytes(16));
+
+        // Run `down` + clear stale caches first.
+        //
+        // The raw `rm` MUST come first: a stale bootstrap/cache/packages.php or
+        // services.php (e.g. left from a previous version that used a package the
+        // current vendor/ no longer ships) poisons the compiled manifest. Every
+        // artisan command — including `optimize:clear` — boots the framework, which
+        // loads that manifest and dies with "Class ... ServiceProvider not found"
+        // before it can clear anything. Deleting the compiled files directly (no
+        // framework boot) lets the app boot fresh and regenerate the manifest.
+        foreach ([
+            149 => "cd {$path} && rm -f bootstrap/cache/packages.php bootstrap/cache/services.php bootstrap/cache/config.php bootstrap/cache/events.php bootstrap/cache/routes-*.php 2>&1",
+            // Install PHP dependencies on the server — vendor/ is excluded from the zip
+            // to keep uploads small. composer must be in PATH on the remote server.
+            // Retry once: a transient composer failure would leave installed.json in a
+            // stale (dev) state, so the manifest rebuild below picks up a dev-only
+            // provider that isn't installed → the whole app 500s. The retry self-heals.
+            148 => "cd {$path} && (composer install --no-dev --optimize-autoloader --no-interaction --no-scripts --no-ansi 2>&1 || (sleep 5 && composer install --no-dev --optimize-autoloader --no-interaction --no-scripts --no-ansi 2>&1)) | grep -v 'Deprecat' | grep -v 'PHP Warning' || true",
+            // Regenerate the package manifest from the fresh --no-dev vendor BEFORE any
+            // framework boot. Deterministic + no DB access; guarded with `|| true` so it
+            // is harmless on non-Laravel sites. Prevents the "Class ...ServiceProvider
+            // not found" boot crash that took the site down when the cache was cleared
+            // but never rebuilt.
+            147 => "cd {$path} && {$php} artisan package:discover --no-interaction 2>&1 || true",
+            15  => "cd {$path} && {$php} artisan down --retry=60 --secret={$token} 2>&1",
+            150 => "cd {$path} && {$php} artisan optimize:clear 2>&1",
+        ] as $earlyStep => $earlyCmd) {
+            $earlyResult = $this->ssh->exec($earlyCmd);
+            $earlyExit   = $earlyResult['exit_code'] ?? 1;
+            $this->log(4, $earlyStep, $earlyExit === 0 ? 'success' : 'error',
+                $earlyCmd, $earlyResult['output'] ?? '', $earlyExit);
+        }
+
+        // Optional: pre-migrate commands (one per line, e.g. "php artisan tenancy:install").
+        // Run before migrate --force so setup commands (publishing migrations, etc.) complete first.
+        if (!empty($this->site->pre_migrate_commands)) {
+            $lines = array_filter(array_map('trim', explode("\n", $this->site->pre_migrate_commands)));
+            foreach ($lines as $i => $line) {
+                $cmdResult = $this->ssh->exec("cd {$path} && {$line} 2>&1");
+                $cmdExit   = $cmdResult['exit_code'] ?? 1;
+                $this->log(4, 155 + $i, $cmdExit === 0 ? 'success' : 'warning',
+                    $line, $cmdResult['output'] ?? '', $cmdExit);
+            }
+        }
+
+        if ($this->deployment->with_database) {
+            // The DB push is DATA-ONLY (mysqldump --no-create-info, pg data-only) and
+            // uses REPLACE/upsert, so the remote SCHEMA must already exist. Run
+            // migrate FIRST: on a fresh database it creates the tables; on an existing
+            // one it's a no-op. Then push the rows — REPLACE makes it idempotent, so
+            // re-deploys overwrite rather than duplicate. (Previously push ran first,
+            // which failed with "table doesn't exist" on a brand-new remote database.)
+            $migrateResult = $this->ssh->exec("cd {$path} && {$php} artisan migrate --force 2>&1");
+            $migrateExit   = $migrateResult['exit_code'] ?? 1;
+            $this->log(4, 16, $migrateExit === 0 ? 'success' : 'error',
+                "cd {$path} && {$php} artisan migrate --force 2>&1",
+                $migrateResult['output'] ?? '', $migrateExit);
+            if ($migrateExit !== 0) {
+                throw new RuntimeException('Migration failed — aborting deploy.');
+            }
+            $this->pushLocalDatabase();
+        } else {
+            $migrateResult = $this->ssh->exec("cd {$path} && {$php} artisan migrate --force 2>&1");
+            $migrateExit   = $migrateResult['exit_code'] ?? 1;
+            $this->log(4, 16, $migrateExit === 0 ? 'success' : 'error',
+                "cd {$path} && {$php} artisan migrate --force 2>&1",
+                $migrateResult['output'] ?? '', $migrateExit);
+            if ($migrateExit !== 0) {
+                throw new RuntimeException('Migration failed — aborting deploy.');
+            }
+        }
+
+        $commands = [];
+
+        // Optional: run tenant migrations (stancl/tenancy multi-tenant apps like Alpha eLibrary).
+        // Runs `tenants:migrate` on all tenant DBs after the central DB is migrated.
+        if ($this->site->run_tenant_migrations) {
+            $tenantMigrateResult = $this->ssh->exec("cd {$path} && {$php} artisan tenants:migrate --force 2>&1");
+            $tenantMigrateExit   = $tenantMigrateResult['exit_code'] ?? 1;
+            $this->log(4, 16, $tenantMigrateExit === 0 ? 'success' : 'error',
+                "cd {$path} && {$php} artisan tenants:migrate --force 2>&1",
+                $tenantMigrateResult['output'] ?? '', $tenantMigrateExit);
+            if ($tenantMigrateExit !== 0) {
+                throw new RuntimeException('Tenant migrations failed — aborting deploy.');
+            }
+        }
+
+        // Optional: run seeders when either:
+        //  - the site has run_seeders = true (persistent setting), OR
+        //  - this specific deployment was triggered with with_data = true (one-off)
+        if ($this->site->run_seeders || $this->deployment->with_data) {
+            $commands[164] = "cd {$path} && {$php} artisan db:seed --force 2>&1";
+        }
+
+        $commands += [
+            17 => "cd {$path} && {$php} artisan config:cache 2>&1",
+            // Use route:clear instead of route:cache — cached routes can cause
+            // 405 Method Not Allowed on POST endpoints with some packages.
+            18 => "cd {$path} && {$php} artisan route:clear 2>&1",
+            19 => "cd {$path} && {$php} artisan view:cache 2>&1",
+            20 => "cd {$path} && {$php} artisan event:cache 2>&1",
+            // storage:link via raw `ln -sfn` instead of `php artisan storage:link`.
+            // The artisan command uses Laravel's Filesystem::link() which calls exec()
+            // internally — many hardened hosts (corapos.com included) have exec disabled
+            // in php.ini → "Call to undefined function exec()". The shell ln works always.
+            // Use ABSOLUTE target path: relative paths cause "Too many levels of symbolic
+            // links" because the resolver treats the link as starting from public/.
+            21 => "rm -f {$path}/public/storage 2>/dev/null; ln -s {$path}/storage/app/public {$path}/public/storage && echo 'Symlink ensured: public/storage -> storage/app/public'",
+            // Republish package assets so public/vendor/* stays in sync with
+            // composer packages after each deploy.
+            // Each command is allowed to "fail" (|| true) since not every
+            // project installs every package; we only care that the ones
+            // present are published.
+            215 => "cd {$path} && ({$php} artisan livewire:publish --assets 2>&1 || true)",
+            216 => "cd {$path} && ({$php} artisan filament:assets 2>&1 || true)",
+            217 => "cd {$path} && ({$php} artisan vendor:publish --tag=livewire:assets --force 2>&1 || true)",
+            22 => "cd {$path} && {$php} artisan queue:restart 2>&1",
+            23 => "cd {$path} && {$php} artisan up 2>&1",
+        ];
+
+        // Re-chown the ENTIRE deploy path after all artisan commands.
+        // Artisan runs as the SSH user (usually root), so config:cache,
+        // route:clear, view:cache, etc. create files owned by root inside
+        // storage/ and bootstrap/cache/. PHP-FPM (www) can't write to them
+        // → 500 "Permission denied" on the live site.
+        $webUser = $this->webUser();
+        if ($webUser) {
+            $owner = escapeshellarg($webUser . ':' . $webUser);
+            $commands[235] = $this->asRoot("chown -R {$owner} {$path}") . ' 2>/dev/null; true';
+        }
+
+        ksort($commands);
+
+        foreach ($commands as $step => $cmd) {
+            $result = $this->ssh->exec($cmd);
+            $status = $result['exit_code'] === 0 ? 'success' : 'error';
+
+            // storage:link is fine if already linked
+            if ($step === 21 && str_contains($result['output'], 'already exists')) {
+                $status = 'success';
+            }
+
+            $this->log(4, $step, $status, $cmd, $result['output'], $result['exit_code']);
+
+            if ($status === 'error' && in_array($step, [16, 23])) {
+                throw new RuntimeException("Critical step {$step} failed: " . $result['output']);
+            }
+        }
+
+        $this->broadcastPhase(4, 'Remote commands complete');
+    }
+
+    // --- Phase 5 ---
+    private function phase5HealthCheck(): bool
+    {
+        $this->log(5, 24, 'info', null, 'Phase 5: Health check');
+
+        $appUrl = $this->site->app_url;
+        if (!$appUrl) {
+            $this->log(5, 24, 'warning', null, 'No app_url configured — skipping HTTP health check');
+            return true;
+        }
+
+        $endpoint = rtrim($appUrl, '/') . config('autopilot.health.endpoint', '/health');
+        $ok       = true;
+
+        try {
+            // SSL verification disabled — we trust the server we just deployed to.
+            // If the deployment broke the app we still see a real 5xx; we don't want a
+            // mis-issued cert (covers `corapos.com` vs `www.corapos.com`) to trigger rollback.
+            $response = Http::withoutVerifying()
+                ->timeout(config('autopilot.health.timeout', 10))
+                ->get($endpoint);
+            $status   = $response->status();
+            $expected = config('autopilot.health.expected_codes', [200]);
+
+            if (in_array($status, $expected)) {
+                $this->log(5, 24, 'success', "GET {$endpoint}", "HTTP {$status}");
+            } elseif ($status >= 400 && $status < 500) {
+                // 4xx typically means the app is up but /health route doesn't exist.
+                // That's not a deployment failure — warn and continue.
+                $this->log(5, 24, 'warning', "GET {$endpoint}",
+                    "HTTP {$status} — health endpoint not found or not configured. " .
+                    "App appears reachable; skipping rollback. " .
+                    "Add a /health route to the app (or change autopilot.health.endpoint) to get true health verification.");
+            } else {
+                // 5xx / unexpected — warn but don't rollback.
+                // The deploy itself may be fine; the 500 could be a missing
+                // /health route, a temporary DB issue, or an unrelated bug.
+                // Rolling back a successful deploy is more destructive than
+                // leaving it up for manual inspection.
+                $this->log(5, 24, 'warning', "GET {$endpoint}",
+                    "HTTP {$status} — server returned an error. " .
+                    "Deploy will NOT be rolled back automatically. " .
+                    "Check the remote Laravel log for details.");
+            }
+        } catch (\Throwable $e) {
+            // Connection error (DNS, timeout, etc.) — warn only, no rollback
+            $this->log(5, 24, 'warning', "GET {$endpoint}",
+                'Health check unreachable: ' . $e->getMessage() . ' — skipping rollback.');
+        }
+
+        // Step 25-26: Check Laravel logs
+        $logOutput = $this->getRemoteErrorLog();
+        $this->log(5, 25, 'info', null, 'Last 50 lines of Laravel log retrieved');
+
+        if ($logOutput) {
+            try {
+                $analysis = $this->claude->analysePostDeployLogs($logOutput);
+                $aiStatus = $analysis['status'] ?? 'ok';
+                $logStatus = $aiStatus === 'critical' ? 'error' : ($aiStatus === 'warning' ? 'warning' : 'success');
+                $this->log(5, 26, $logStatus, null, 'AI log analysis: ' . json_encode($analysis), null, $analysis);
+
+                if ($aiStatus === 'critical') {
+                    $this->log(5, 26, 'warning', null, 'AI flagged critical issues in logs, but rollback is not triggered automatically — inspect logs manually.');
+                }
+            } catch (\Throwable $e) {
+                $this->log(5, 26, 'warning', null, 'AI analysis failed: ' . $e->getMessage());
+            }
+        }
+
+        $this->broadcastPhase(5, 'Health check complete');
+        return $ok ?? false;
+    }
+
+    // --- Phase 6 ---
+    private function phase6Rollback(string $errorLog = ''): void
+    {
+        $this->log(6, 28, 'warning', null, 'Phase 6: Initiating rollback');
+        // Hand our already-connected SSH to the rollback service so it doesn't
+        // try to reuse a different (disconnected) DI-resolved instance.
+        $this->rollback->setSsh($this->ssh);
+        $this->rollback->rollback($this->deployment, $errorLog);
+        $this->broadcastPhase(6, 'Rollback complete');
+    }
+
+    private function pushLocalDatabase(): void
+    {
+        $sourcePath = $this->getSourcePath();
+        if (!$sourcePath || !is_dir($sourcePath)) {
+            $this->log(4, 162, 'warning', null, 'with_database=true but no local source_path — skipping DB push.');
+            return;
+        }
+
+        $this->log(4, 162, 'info', null, 'Dumping local database and pushing to server…');
+
+        try {
+            $sync   = app(DatabaseSyncService::class);
+            $result = $sync->pushLocalToRemote($this->ssh, $this->site, $sourcePath, $this->deployment->id);
+            $this->log(4, 162, 'success', null,
+                "Database pushed: {$result['sizeMb']} MB dump imported on server.");
+        } catch (\Throwable $e) {
+            // DB push is invasive; fail loud so the user knows it didn't apply.
+            $this->log(4, 162, 'error', null, 'Database push failed: ' . $e->getMessage());
+            throw $e;
+        }
+    }
+
+    private function getRemoteErrorLog(): string
+    {
+        $path   = escapeshellarg($this->site->deploy_path . '/storage/logs/laravel.log');
+        $result = $this->ssh->exec("tail -50 {$path} 2>/dev/null");
+        return $result['output'] ?? '';
+    }
+
+    private function log(int $phase, int $step, string $status, ?string $command, ?string $output, ?int $exitCode = null, ?array $aiDiagnosis = null): void
+    {
+        if ($output !== null) {
+            $output = preg_replace('/\x1B\[[0-9;]*[mGKHF]/u', '', $output);
+        }
+        DeployLog::record($this->deployment->id, $phase, $step, $status, $command, $output, $exitCode, $aiDiagnosis);
+    }
+
+    private function broadcastPhase(int $phase, string $message): void
+    {
+        event(new DeploymentPhaseCompleted($this->deployment, $phase, $message));
+    }
+}
