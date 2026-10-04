@@ -5,16 +5,36 @@ use App\Http\Controllers\DeployController;
 use App\Http\Controllers\LogController;
 use App\Http\Controllers\ServerController;
 use App\Http\Controllers\SiteController;
+use App\Http\Controllers\TwoFactorController;
 use App\Http\Controllers\UserController;
 use Illuminate\Support\Facades\Route;
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 Route::middleware('guest')->group(function () {
     Route::get('/login', [AuthController::class, 'showLogin'])->name('login');
-    Route::post('/login', [AuthController::class, 'login'])->name('login.post');
+
+    // Phase 6: this dashboard holds SSH credentials for every server, so the
+    // login endpoint is rate-limited. 5 attempts/minute per IP+email.
+    Route::post('/login', [AuthController::class, 'login'])
+        ->middleware('throttle:login')
+        ->name('login.post');
+
+    // Second factor. Guarded by a session key rather than auth — the user is
+    // deliberately NOT logged in until the code verifies.
+    Route::get('/two-factor', [AuthController::class, 'showTwoFactorChallenge'])->name('two-factor.challenge');
+    Route::post('/two-factor', [AuthController::class, 'verifyTwoFactor'])
+        ->middleware('throttle:login')
+        ->name('two-factor.verify');
 });
 
 Route::post('/logout', [AuthController::class, 'logout'])->middleware('auth')->name('logout');
+
+// ─── Two-factor enrolment (authenticated) ─────────────────────────────────────
+Route::middleware('auth')->group(function () {
+    Route::post('/two-factor/enroll', [TwoFactorController::class, 'enroll'])->name('two-factor.enroll');
+    Route::post('/two-factor/confirm', [TwoFactorController::class, 'confirm'])->name('two-factor.confirm');
+    Route::delete('/two-factor', [TwoFactorController::class, 'disable'])->name('two-factor.disable');
+});
 
 // ─── Health check (public, rate-limited) ──────────────────────────────────────
 Route::get('/health', [DeployController::class, 'health'])

@@ -13,9 +13,9 @@ class AdminUserSeeder extends Seeder
         User::updateOrCreate(
             ['email' => 'admin@autopilot.local'],
             [
-                'name'     => 'Admin',
+                'name' => 'Admin',
                 'password' => Hash::make('password'),
-                'role'     => 'admin',
+                'role' => 'admin',
             ]
         );
     }

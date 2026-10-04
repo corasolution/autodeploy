@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\Site;
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
@@ -16,7 +17,7 @@ return new class extends Migration
     public function down(): void
     {
         Schema::table('deployments', function (Blueprint $table) {
-            $table->dropForeignIdFor(\App\Models\Site::class);
+            $table->dropForeignIdFor(Site::class);
             $table->dropColumn('site_id');
         });
     }
