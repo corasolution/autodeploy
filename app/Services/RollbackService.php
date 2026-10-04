@@ -57,6 +57,17 @@ class RollbackService
                 $atomic->switchTo($site, $deployment->previous_release);
                 $reload = $atomic->reload($site);
 
+                // R2: workers are still running the failed release's code until
+                // they are told to restart, and `current` now points back at the
+                // previous one.
+                $php = escapeshellarg($site->php_binary ?: 'php');
+                $restart = $this->ssh->exec(
+                    'cd '.escapeshellarg($site->currentPath())." && {$php} artisan queue:restart 2>&1"
+                );
+                DeployLog::record($deployment->id, 6, 22,
+                    ($restart['exit_code'] ?? 1) === 0 ? 'success' : 'warning',
+                    'php artisan queue:restart', $restart['output'] ?? '', $restart['exit_code'] ?? null);
+
                 DeployLog::record($deployment->id, 6, 29, 'success', null,
                     'Rolled back: current → '.basename($deployment->previous_release)
                     .($reload['skipped'] ? ' (no reload_command set)' : ' and PHP-FPM reloaded'));

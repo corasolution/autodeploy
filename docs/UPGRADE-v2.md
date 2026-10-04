@@ -179,3 +179,44 @@ jobs:
 - All remote commands go through `SshService::exec`; all local commands through `Process`. No new `shell_exec`.
 - Every new remote command must be logged via `$this->log()` with a step number in the existing numbering style.
 - Never log or send to Claude: `env_content`, private keys, panel tokens, webhook secrets.
+
+---
+
+## Phase 7 — Review fixes (complete)
+
+Spec: `docs/UPGRADE-v2-phase7.md`.
+
+| # | Status | Notes |
+|---|---|---|
+| R1 | Done, **with a correction** | See below — the diagnosed cause was wrong. |
+| R2 | Done | `queue:restart` moved after the atomic switch, targeting `current/`; also added to both rollback paths. |
+| R3 | Done | Composer can fail again; noise filtered in PHP; release boot check before migrate/switch. |
+| R4 | Done | Audit moved between phase 4a/4b (atomic) or after build/before upload (in_place); migration bodies now sent. |
+| R5 | Done | Atomic uses targeted `*:clear` instead of `optimize:clear`. |
+
+### R1 correction — the model id was never the problem
+
+The spec asserted `claude-sonnet-5` is invalid and prescribed changing
+`model_smart` to `claude-sonnet-5-5`. **That is backwards.** `claude-sonnet-5`
+is the correct id for Sonnet 5; `claude-sonnet-5-5` does not exist. Applying
+the prescribed change would have introduced the exact silent failure it was
+meant to fix.
+
+The *symptom* described in R1 was real, and `autopilot:ai-ping` (added by R1
+step 5) identified the actual cause on its first run:
+
+```
+FAIL fast   claude-haiku-4-5-20251001
+     Your credit balance is too low to access the Anthropic API.
+FAIL smart  claude-sonnet-5
+     Your credit balance is too low to access the Anthropic API.
+```
+
+Verified by sending a deliberately bogus model id (`totally-not-a-model-xyz`)
+and getting the *same* billing error — the API rejects on balance before it
+validates the model, so a failing ping says nothing about model correctness
+while billing is unresolved.
+
+**Action required:** add credit to the Anthropic account. Until then the AI
+layer returns fallbacks — now logged and surfaced in the UI rather than
+silent. Model ids are left at `claude-sonnet-5` / `claude-haiku-4-5-20251001`.

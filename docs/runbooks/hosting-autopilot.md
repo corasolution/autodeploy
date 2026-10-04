@@ -135,13 +135,44 @@ Update `vars.AUTOPILOT_URL` in each GitHub repo to the new HTTPS URL. The
 webhook secret is unchanged if you carried the database across; otherwise
 rotate it from the site's webhook tab and update `secrets.AUTOPILOT_SECRET`.
 
+## Client-site queue workers — point them at `current/`
+
+> Applies to Supervisor programs on the servers you DEPLOY TO, not to AutoPilot
+> itself. Only relevant once a site is converted to `atomic`.
+
+A worker started from a release path stays pinned to that release forever —
+every later deploy leaves it running code that no longer exists on disk:
+
+```ini
+; WRONG — pinned to release 412 for the rest of time
+command=php /www/wwwroot/app/releases/412/artisan queue:work
+```
+
+```ini
+; RIGHT — follows the symlink, so queue:restart picks up each new release
+command=php /www/wwwroot/app/current/artisan queue:work
+```
+
+AutoPilot issues `queue:restart` against `current/` immediately after the
+atomic switch and after a rollback, which is what tells those workers to exit
+and come back on the new code.
+
 ## Verifying
 
 ```bash
 supervisorctl status                      # all three RUNNING
 curl -fsS https://autopilot.example.com/up
+php artisan autopilot:ai-ping             # both Claude models answer
 php artisan queue:work --once --queue=deployments   # drains one job by hand
 ```
+
+`autopilot:ai-ping` is worth running after any `.env` change. The AI layer
+degrades silently by design — it must never fail a deploy — so a revoked key,
+an exhausted balance or a bad model id shows up as empty verdicts rather than
+errors. The ping is the only thing that distinguishes "nothing to report" from
+"never ran". Note that billing and auth failures are returned BEFORE the model
+id is validated, so while billing is failing the ping cannot confirm the model
+ids either way.
 
 Then trigger one real deploy from the UI and watch the live terminal — that
 exercises the worker, Reverb and SSH in one go.

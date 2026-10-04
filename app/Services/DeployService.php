@@ -71,6 +71,27 @@ class DeployService
         return 'mysql';
     }
 
+    /**
+     * Drop deprecation and warning chatter from command output before logging.
+     *
+     * This used to be `| grep -v 'Deprecat' | grep -v 'PHP Warning'` in the
+     * shell, where it replaced the command's exit status with grep's — which is
+     * how a failed composer install came back as success (R3). Filtering here
+     * leaves the exit code untouched.
+     */
+    private function filterNoise(string $output): string
+    {
+        // Split on \n and strip any \r — remote output may arrive CRLF, and a
+        // literal line break in this source file would itself be CRLF on
+        // Windows, which silently matched nothing and ate the whole output.
+        $kept = array_filter(
+            preg_split('/\r?\n/', $output) ?: [],
+            fn ($line) => ! str_contains($line, 'Deprecat') && ! str_contains($line, 'PHP Warning'),
+        );
+
+        return trim(implode("\n", $kept));
+    }
+
     /** Code directory for this deploy: the new release, or deploy_path. */
     private function targetPath(): string
     {
@@ -175,14 +196,6 @@ class DeployService
         try {
             $this->phase1PreFlight();
 
-            // Phase 4: AI risk audit. A `high` verdict parks the deploy in
-            // awaiting_approval and stops here — including webhook deploys.
-            if ($this->auditRequiresApproval()) {
-                $this->broadcastPhase(1, 'Awaiting approval');
-
-                return;
-            }
-
             // Phase 2 (atomic): prepare releases/ + shared/ and record what
             // `current` points at, so a failure can swap straight back to it.
             if ($this->site->isAtomic()) {
@@ -195,21 +208,73 @@ class DeployService
             // Mode A: neither set    → remote commands only (code already on server)
             if ($this->site->source_path) {
                 $this->phase2BuildAssets();
+
+                // R4 (in_place): audit AFTER the local build — so migration
+                // files exist to inspect — and BEFORE the upload overwrites the
+                // live directory. There is no staging area in in_place mode, so
+                // this is the last point where stopping changes nothing.
+                if (! $this->site->isAtomic() && $this->auditRequiresApproval()) {
+                    $this->broadcastPhase(2, 'Awaiting approval');
+
+                    return;
+                }
+
                 $this->phase3Upload();
             } elseif ($this->site->repo_url) {
                 $this->phase2CloneAndBuild();
+
+                if (! $this->site->isAtomic() && $this->auditRequiresApproval()) {
+                    $this->broadcastPhase(2, 'Awaiting approval');
+
+                    return;
+                }
+
                 $this->phase3Upload();
             } else {
                 $this->log(2, 7, 'info', null,
                     'Phase 2 & 3 skipped — no source_path or repo_url set. '.
                     'Running remote commands only on existing server code.');
+
+                // Mode A: no local source, so there are no new migration files
+                // to inspect — the env-key half of the audit still applies.
+                if (! $this->site->isAtomic() && $this->auditRequiresApproval()) {
+                    $this->broadcastPhase(2, 'Awaiting approval');
+
+                    return;
+                }
             }
 
+            // Phase 4a — build the release: link shared, composer, discover.
             $this->phase4RemoteCommands();
+
+            // R4 (atomic): the audit runs HERE. The release is prepared, so
+            // `migrate:status` inside it lists the migrations THIS deploy adds —
+            // which is what the old pre-flight placement could never see, since
+            // it queried `current` (the old code) before anything was uploaded.
+            // Nothing has been migrated and `current` is untouched, so holding
+            // the deploy here leaves the live site exactly as it was.
+            if ($this->site->isAtomic() && $this->auditRequiresApproval()) {
+                $this->log(2, 27, 'info', null, sprintf(
+                    'Prepared release %s kept on disk for approval. The live site is unchanged. '
+                    .'Approving re-runs this deployment and reuses the same release directory.',
+                    basename((string) $this->releasePath),
+                ));
+                $this->broadcastPhase(4, 'Awaiting approval');
+
+                return;
+            }
+
+            // Phase 4b — pre-migrate, migrate, caches, up.
+            $this->phase4Migrate();
 
             // The live site still serves the OLD release until this point.
             if ($this->site->isAtomic()) {
                 $this->completeAtomicRelease();
+
+                // R2: only now is `current` the new release, so workers
+                // restarted here pick up the new code. Pointed at current/ so
+                // they are not pinned to this release on the next deploy.
+                $this->restartQueues($this->site->currentPath());
             }
 
             $healthy = $this->phase5HealthCheck();
@@ -855,21 +920,33 @@ class DeployService
         // via maintenance_on_migrate.
         $useMaintenance = ! $this->site->isAtomic() || $this->site->maintenance_on_migrate;
 
+        $isAtomic = $this->site->isAtomic();
+
+        // R3: composer must be able to FAIL. The old pipeline ended in
+        // `| grep -v … || true`, so a failed install exited 0 and a release with
+        // a missing or partial vendor/ was switched live. Noise filtering moved
+        // into PHP (filterNoise) — doing it in the shell is what swallowed the
+        // exit code. The single retry stays: a transient composer failure leaves
+        // installed.json in a stale dev state, and the retry self-heals it.
+        $composer = 'composer install --no-dev --optimize-autoloader --no-interaction --no-scripts --no-ansi';
+
         $earlyCommands = [
             149 => "cd {$path} && rm -f bootstrap/cache/packages.php bootstrap/cache/services.php bootstrap/cache/config.php bootstrap/cache/events.php bootstrap/cache/routes-*.php 2>&1",
-            // Install PHP dependencies on the server — vendor/ is excluded from the zip
-            // to keep uploads small. composer must be in PATH on the remote server.
-            // Retry once: a transient composer failure would leave installed.json in a
-            // stale (dev) state, so the manifest rebuild below picks up a dev-only
-            // provider that isn't installed → the whole app 500s. The retry self-heals.
-            148 => "cd {$path} && (composer install --no-dev --optimize-autoloader --no-interaction --no-scripts --no-ansi 2>&1 || (sleep 5 && composer install --no-dev --optimize-autoloader --no-interaction --no-scripts --no-ansi 2>&1)) | grep -v 'Deprecat' | grep -v 'PHP Warning' || true",
-            // Regenerate the package manifest from the fresh --no-dev vendor BEFORE any
-            // framework boot. Deterministic + no DB access; guarded with `|| true` so it
-            // is harmless on non-Laravel sites. Prevents the "Class ...ServiceProvider
-            // not found" boot crash that took the site down when the cache was cleared
-            // but never rebuilt.
-            147 => "cd {$path} && {$php} artisan package:discover --no-interaction 2>&1 || true",
-            150 => "cd {$path} && {$php} artisan optimize:clear 2>&1",
+            148 => "cd {$path} && ({$composer} 2>&1 || (sleep 5 && {$composer} 2>&1))",
+            // Regenerate the package manifest from the fresh --no-dev vendor BEFORE
+            // any framework boot. Prevents the "Class ...ServiceProvider not found"
+            // boot crash when the cache was cleared but never rebuilt.
+            //
+            // R3: `|| true` is kept ONLY for in_place, where a non-Laravel site is
+            // legitimate. On an atomic site a failed package:discover means the
+            // release is broken and must not be switched live.
+            147 => "cd {$path} && {$php} artisan package:discover --no-interaction 2>&1".($isAtomic ? '' : ' || true'),
+            // R5: optimize:clear includes cache:clear. Atomic sites share storage/
+            // (and usually Redis) with the LIVE release, so clearing it here would
+            // flush the running site's cache while merely preparing a release.
+            150 => $isAtomic
+                ? "cd {$path} && {$php} artisan config:clear 2>&1 && {$php} artisan route:clear 2>&1 && {$php} artisan view:clear 2>&1 && {$php} artisan event:clear 2>&1"
+                : "cd {$path} && {$php} artisan optimize:clear 2>&1",
         ];
 
         if ($useMaintenance) {
@@ -880,8 +957,33 @@ class DeployService
         foreach ($earlyCommands as $earlyStep => $earlyCmd) {
             $earlyResult = $this->ssh->exec($earlyCmd);
             $earlyExit = $earlyResult['exit_code'] ?? 1;
+
+            // Noise is stripped here, in PHP, so the exit code above is the real
+            // one (R3). Filtering in the shell is what hid composer failures.
+            $earlyOutput = $this->filterNoise($earlyResult['output'] ?? '');
+
             $this->log(4, $earlyStep, $earlyExit === 0 ? 'success' : 'error',
-                $earlyCmd, $earlyResult['output'] ?? '', $earlyExit);
+                $earlyCmd, $earlyOutput, $earlyExit);
+
+            // R3: composer is not optional. A release without a complete vendor/
+            // is broken, and on an atomic site it must never reach the switch.
+            if ($earlyStep === 148 && $earlyExit !== 0) {
+                $this->diagnoseFailedStep(4, 148, $earlyCmd, $earlyOutput);
+
+                throw new RuntimeException(
+                    'composer install failed — release not activated. '.$earlyOutput
+                );
+            }
+
+            // package:discover keeps `|| true` on in_place (non-Laravel sites are
+            // legitimate there), so a non-zero exit here only happens on atomic.
+            if ($earlyStep === 147 && $earlyExit !== 0) {
+                $this->diagnoseFailedStep(4, 147, $earlyCmd, $earlyOutput);
+
+                throw new RuntimeException(
+                    'package:discover failed — release not activated. '.$earlyOutput
+                );
+            }
 
             // From here on the site serves a 503 until step 23 lifts it, so any
             // throw in between must be caught by run() and trigger liftMaintenance().
@@ -889,6 +991,43 @@ class DeployService
                 $this->maintenanceOn = true;
             }
         }
+
+        // R3: prove the release can actually boot before anything irreversible
+        // (migrate) or visible (the switch) happens. A vendor/ that installed
+        // with exit 0 but is missing the autoloader still cannot run.
+        if ($isAtomic) {
+            $check = $this->ssh->exec(
+                "cd {$path} && test -f vendor/autoload.php && {$php} artisan --version 2>&1"
+            );
+            $checkExit = $check['exit_code'] ?? 1;
+
+            $this->log(4, 151, $checkExit === 0 ? 'success' : 'error',
+                'test -f vendor/autoload.php && artisan --version',
+                $this->filterNoise($check['output'] ?? ''), $checkExit);
+
+            if ($checkExit !== 0) {
+                throw new RuntimeException(
+                    'Release cannot boot (vendor/autoload.php missing or artisan failed) — '
+                    .'release not activated. '.$this->filterNoise($check['output'] ?? '')
+                );
+            }
+        }
+
+        $this->broadcastPhase(4, 'Release prepared');
+    }
+
+    /**
+     * Phase 4b — everything from pre-migrate commands onward.
+     *
+     * R4: split out of phase4RemoteCommands() so the risk audit can run between
+     * the two. The audit needs a prepared release (vendor/ installed, artisan
+     * runnable) to list pending migrations, but must happen before `migrate`
+     * writes anything or the switch makes it visible.
+     */
+    private function phase4Migrate(): void
+    {
+        $path = escapeshellarg($this->targetPath());
+        $php = escapeshellarg($this->site->php_binary ?: 'php');
 
         // Optional: pre-migrate commands (one per line, e.g. "php artisan tenancy:install").
         // Run before migrate --force so setup commands (publishing migrations, etc.) complete first.
@@ -973,7 +1112,10 @@ class DeployService
             // Steps 215/216/217 (livewire:publish, filament:assets) removed in
             // UPGRADE-v2 Phase 1 — this project dropped FilamentPHP, and the
             // commands were `|| true` no-ops costing three SSH round-trips.
-            22 => "cd {$path} && {$php} artisan queue:restart 2>&1",
+            // R2: step 22 moved out for atomic sites — see restartQueues(). Here
+            // it would restart workers while `current` still points at the OLD
+            // release, pinning them to stale code until the next deploy.
+
             23 => "cd {$path} && {$php} artisan up 2>&1",
         ];
 
@@ -982,6 +1124,12 @@ class DeployService
         // route:clear, view:cache, etc. create files owned by root inside
         // storage/ and bootstrap/cache/. PHP-FPM (www) can't write to them
         // → 500 "Permission denied" on the live site.
+        if (! $this->site->isAtomic()) {
+            // in_place writes over the live directory, so by the time we get
+            // here the new code IS the live code — restarting now is correct.
+            $commands[22] = "cd {$path} && {$php} artisan queue:restart 2>&1";
+        }
+
         $webUser = $this->webUser();
         if ($webUser) {
             $owner = escapeshellarg($webUser.':'.$webUser);
@@ -1226,7 +1374,20 @@ class DeployService
                 $diff[] = "- {$key} (present on server, missing locally)";
             }
 
-            $migrations = $this->pendingMigrations();
+            // R4: where the pending migrations come from depends on the mode.
+            //
+            // Atomic — the release is already prepared on the server, so ask it
+            // directly; that is the code about to run.
+            //
+            // in_place — the audit runs before upload, so the server still has
+            // the OLD code and cannot report the new migrations. Diff the local
+            // files against what the server says it has already run.
+            //
+            // Mode A (no local source) falls through to an empty list, leaving
+            // the env-key half of the audit intact.
+            $migrations = $this->site->isAtomic() && $this->releasePath
+                ? $this->pendingMigrations($this->releasePath)
+                : $this->pendingMigrationsFromLocal();
 
             if ($diff === [] && $migrations === []) {
                 $this->log(1, 162, 'success', null, 'Risk audit: no env key changes and no pending migrations.');
@@ -1293,15 +1454,142 @@ class DeployService
      * Pending migrations as reported by the code already on the server. On a
      * first deploy there is nothing to ask, so this is best-effort.
      */
-    private function pendingMigrations(): array
+    /**
+     * Pending migrations for an in_place deploy.
+     *
+     * R4: the audit runs BEFORE the upload here, so the server still has the
+     * old code and `migrate:status --pending` there cannot see the migrations
+     * this deploy adds. Diff the local migration filenames against the ones the
+     * server reports as already Ran instead.
+     */
+    private function pendingMigrationsFromLocal(): array
+    {
+        $source = $this->getSourcePath();
+
+        if (! $source || ! is_dir($source.DIRECTORY_SEPARATOR.'database'.DIRECTORY_SEPARATOR.'migrations')) {
+            return [];
+        }
+
+        $dir = $source.DIRECTORY_SEPARATOR.'database'.DIRECTORY_SEPARATOR.'migrations';
+        $localFiles = glob($dir.DIRECTORY_SEPARATOR.'*.php') ?: [];
+
+        if ($localFiles === []) {
+            return [];
+        }
+
+        $ran = $this->ranMigrationsOnServer();
+
+        $pending = [];
+        foreach ($localFiles as $file) {
+            $name = basename($file, '.php');
+
+            if (in_array($name, $ran, true)) {
+                continue;
+            }
+
+            // Same 4 KB cap as the remote path — enough to see what up() does
+            // without posting an entire large migration.
+            $body = trim((string) file_get_contents($file, false, null, 0, 4096));
+
+            $pending[] = $body === '' ? $name : $name."\n".$body;
+        }
+
+        return $pending;
+    }
+
+    /**
+     * Migration names the server reports as already Ran. Empty (with a warning)
+     * if the status call fails — a first deploy against an empty database is
+     * the normal case for that.
+     */
+    private function ranMigrationsOnServer(): array
     {
         $php = escapeshellarg($this->site->php_binary ?: 'php');
-        $path = escapeshellarg($this->site->isAtomic() ? $this->site->currentPath() : $this->site->deploy_path);
+        $path = escapeshellarg($this->site->deploy_path);
 
-        $result = $this->ssh->exec("cd {$path} && {$php} artisan migrate:status --pending 2>/dev/null || true");
-        $lines = array_filter(array_map('trim', explode("\n", $result['output'] ?? '')));
+        $result = $this->ssh->exec("cd {$path} && {$php} artisan migrate:status 2>&1");
 
-        return array_values(array_filter($lines, fn ($l) => str_contains($l, '_') && ! str_starts_with($l, '+')));
+        if (($result['exit_code'] ?? 1) !== 0) {
+            $this->log(1, 162, 'warning', null,
+                'Could not read migration status from the server — treating every local '
+                .'migration as pending for the risk audit. '
+                .$this->filterNoise($result['output'] ?? ''));
+
+            return [];
+        }
+
+        $ran = [];
+        foreach (explode("\n", $result['output'] ?? '') as $line) {
+            // Only "Ran" rows; "Pending" ones are still pending.
+            if (! preg_match('/\bRan\b/i', $line)) {
+                continue;
+            }
+
+            if (preg_match('/(\d{4}_\d{2}_\d{2}_\d{6}_[A-Za-z0-9_]+)/', $line, $m)) {
+                $ran[] = $m[1];
+            }
+        }
+
+        return array_values(array_unique($ran));
+    }
+
+    /**
+     * Migrations this deploy will run, as "name" plus the body of up().
+     *
+     * R4: the caller passes the path explicitly. It used to query `current`,
+     * i.e. the code already live, so the migrations the deploy was ADDING were
+     * invisible and the high-risk gate could essentially never fire.
+     *
+     * Filenames alone can't tell the model whether a migration is destructive,
+     * so each one's source is included, truncated to 4 KB.
+     */
+    private function pendingMigrations(string $path): array
+    {
+        $php = escapeshellarg($this->site->php_binary ?: 'php');
+        $quoted = escapeshellarg($path);
+
+        $result = $this->ssh->exec("cd {$quoted} && {$php} artisan migrate:status --pending 2>&1");
+
+        if (($result['exit_code'] ?? 1) !== 0) {
+            // Common and benign on a first deploy (no migrations table yet).
+            $this->log(1, 162, 'warning', null,
+                'Could not list pending migrations — the risk audit will cover env keys only. '
+                .$this->filterNoise($result['output'] ?? ''));
+
+            return [];
+        }
+
+        $names = [];
+        foreach (explode("\n", $result['output'] ?? '') as $line) {
+            $line = trim($line);
+            if ($line === '' || str_starts_with($line, '+') || ! str_contains($line, '_')) {
+                continue;
+            }
+
+            // Rows look like "| 2026_10_04_000001_add_foo | Pending |" or
+            // "2026_10_04_000001_add_foo .... Pending".
+            if (preg_match('/(\d{4}_\d{2}_\d{2}_\d{6}_[A-Za-z0-9_]+)/', $line, $m)) {
+                $names[] = $m[1];
+            }
+        }
+
+        $names = array_values(array_unique($names));
+
+        return array_map(fn ($name) => $this->describeMigration($path, $name), $names);
+    }
+
+    /**
+     * Read a migration's source so the audit can judge what it actually does.
+     */
+    private function describeMigration(string $path, string $name): string
+    {
+        $file = escapeshellarg(rtrim($path, '/').'/database/migrations/'.$name.'.php');
+        $result = $this->ssh->exec("head -c 4096 {$file} 2>/dev/null || true");
+        $body = trim($result['output'] ?? '');
+
+        return $body === ''
+            ? $name.' (source unavailable)'
+            : $name."\n".$body;
     }
 
     /**
@@ -1324,6 +1612,26 @@ class DeployService
         } catch (\Throwable $e) {
             $this->log($phase, $step, 'info', null, 'AI diagnosis unavailable: '.$e->getMessage());
         }
+    }
+
+    /**
+     * Step 22 — tell queue workers to pick up the new code.
+     *
+     * R2: on atomic sites this MUST run after the switch and against
+     * `current`, not against a release path. Workers restarted before the
+     * switch come back on the old release; workers started from a release path
+     * stay pinned to that release forever.
+     */
+    private function restartQueues(string $path): void
+    {
+        $php = escapeshellarg($this->site->php_binary ?: 'php');
+        $cmd = 'cd '.escapeshellarg($path)." && {$php} artisan queue:restart 2>&1";
+
+        $result = $this->ssh->exec($cmd);
+        $exit = $result['exit_code'] ?? 1;
+
+        $this->log(4, 22, $exit === 0 ? 'success' : 'warning', $cmd,
+            $this->filterNoise($result['output'] ?? ''), $exit);
     }
 
     private function atomic(): AtomicReleaseService

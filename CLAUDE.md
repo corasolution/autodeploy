@@ -4,9 +4,12 @@
 > This file governs how Claude Code operates inside this project.
 > Claude Code must read this file fully before executing any task.
 
-**UPGRADE-v2 is complete** (phases 1–6, see `docs/UPGRADE-v2.md` for the
-original spec). Phase 6's VPS move is a runbook, not code — see
-`docs/runbooks/hosting-autopilot.md`.
+**UPGRADE-v2 is complete** (phases 1–7, see `docs/UPGRADE-v2.md`). Phase 6's
+VPS move is a runbook, not code — see `docs/runbooks/hosting-autopilot.md`.
+
+> The AI layer currently returns fallbacks: the Anthropic account has no
+> credit. Run `php artisan autopilot:ai-ping` to check. Model ids are correct
+> (`claude-sonnet-5` / `claude-haiku-4-5-20251001`) — do not "fix" them.
 
 ---
 

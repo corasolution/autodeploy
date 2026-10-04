@@ -279,6 +279,16 @@ class DeployController extends Controller
             $atomic->switchTo($site, $deployment->release_path);
             $reload = $atomic->reload($site);
 
+            // R2: restart workers against current/ so they leave the release
+            // that was just rolled away from.
+            $php = escapeshellarg($site->php_binary ?: 'php');
+            $restart = $ssh->exec(
+                'cd '.escapeshellarg($site->currentPath())." && {$php} artisan queue:restart 2>&1"
+            );
+            DeployLog::record($deployment->id, 6, 22,
+                ($restart['exit_code'] ?? 1) === 0 ? 'success' : 'warning',
+                'php artisan queue:restart', $restart['output'] ?? '', $restart['exit_code'] ?? null);
+
             DeployLog::record($deployment->id, 6, 32, 'success', null,
                 'Manual rollback: current → '.basename($deployment->release_path)
                 .($reload['skipped'] ? ' (no reload_command set — opcache may lag)' : ' and PHP-FPM reloaded'));

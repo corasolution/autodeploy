@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Anthropic\Laravel\Facades\Anthropic;
+use Illuminate\Support\Facades\Log;
 
 /**
  * UPGRADE-v2 Phase 4.
@@ -44,7 +45,12 @@ class ClaudeAgentService
             .'Identify breaking changes, missing env keys, and risky (destructive, '
             ."non-reversible, or long-locking) migrations.\n"
             ."Return ONLY valid JSON: { \"risk_level\": \"low|medium|high\", \"warnings\": [], \"suggestions\": [] }\n\n"
-            ."ENV KEY DIFF:\n{$envDiff}\n\nPENDING MIGRATIONS:\n".implode("\n", $migrations);
+            // R4: each entry is a migration name followed by its source, so the
+            // model can tell an additive column from a dropColumn. Separated by
+            // a rule because the bodies are multi-line.
+            ."ENV KEY DIFF (names only — values are never sent):\n{$envDiff}\n\n"
+            ."PENDING MIGRATIONS (name, then source):\n"
+            .implode("\n\n---\n\n", $migrations);
 
         return $this->call($prompt, $this->modelSmart,
             'You are a Laravel deployment risk auditor. Respond with JSON only.',
@@ -88,7 +94,15 @@ class ClaudeAgentService
     }
 
     /**
-     * @param  array  $fallback  returned (merged with `raw`) when the reply isn't JSON
+     * Send one prompt and parse the JSON reply.
+     *
+     * R1: degrading to a fallback is correct — an advisory feature must never
+     * fail a deploy — but doing it SILENTLY was a bug. A wrong model id or a
+     * revoked key made the whole AI layer look healthy while doing nothing.
+     * Every fallback is now logged and carries `fallback => true`, so callers
+     * and the UI can say "AI unavailable" instead of showing an empty verdict.
+     *
+     * @param  array  $fallback  returned (plus `fallback` and `raw`) on any failure
      */
     private function call(string $prompt, string $model, string $system, array $fallback): array
     {
@@ -106,17 +120,64 @@ class ClaudeAgentService
 
             $content = $response->content[0]->text ?? '';
         } catch (\Throwable $e) {
-            // Network failure, bad key, rate limit — never fatal to a deploy.
-            return $fallback + ['raw' => 'Claude request failed: '.$e->getMessage()];
+            // Network failure, bad key, bad model id, rate limit.
+            return $this->fallback($fallback, $model, 'request_failed', $e->getMessage());
         }
 
         $decoded = json_decode($this->stripJsonFence($content), true);
 
         if (json_last_error() !== JSON_ERROR_NONE || ! is_array($decoded)) {
-            return $fallback + ['raw' => $content];
+            return $this->fallback($fallback, $model, 'invalid_json', $content);
         }
 
         return $decoded;
+    }
+
+    /**
+     * Build and log a fallback result. The reason is truncated — a model can
+     * return a lot of prose, and this goes to the application log.
+     */
+    private function fallback(array $fallback, string $model, string $reason, string $detail): array
+    {
+        Log::warning('Claude fallback used', [
+            'model' => $model,
+            'reason' => $reason,
+            'detail' => mb_substr(trim($detail), 0, 500),
+        ]);
+
+        return $fallback + [
+            'fallback' => true,
+            'reason' => $reason,
+            'raw' => $detail,
+        ];
+    }
+
+    /**
+     * Round-trip both configured models. Used by `autopilot:ai-ping` to prove
+     * the AI layer actually works, rather than inferring it from silence.
+     *
+     * @return array{ok: bool, model: string, detail: string}
+     */
+    public function ping(string $which = 'smart'): array
+    {
+        $model = $which === 'fast' ? $this->modelFast : $this->modelSmart;
+
+        try {
+            $response = Anthropic::messages()->create([
+                'model' => $model,
+                'max_tokens' => 64,
+                'system' => 'Reply with JSON only.',
+                'messages' => [
+                    ['role' => 'user', 'content' => 'Return exactly: {"ok": true}'],
+                ],
+            ]);
+
+            $text = trim($response->content[0]->text ?? '');
+
+            return ['ok' => true, 'model' => $model, 'detail' => $text];
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'model' => $model, 'detail' => $e->getMessage()];
+        }
     }
 
     /**

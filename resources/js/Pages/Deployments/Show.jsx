@@ -159,17 +159,40 @@ export default function DeploymentShow({ deployment: initial }) {
                 <InfoCard label="Duration" value={dep.duration_seconds ? `${dep.duration_seconds}s` : isLive ? 'running…' : '—'} />
             </div>
 
-            {/* AI audit */}
+            {/* AI audit. R1: a fallback result means the AI layer never ran —
+                show that plainly instead of an empty verdict that looks like
+                a clean bill of health. */}
             {dep.ai_audit_result && (
-                <div className="mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4">
-                    <h3 className="text-sm font-semibold text-amber-700 mb-1 flex items-center gap-2">
-                        <IconWarning className="w-4 h-4" />
-                        AI Audit
-                    </h3>
-                    <p className="text-sm text-slate-700">
-                        Risk: <span className="font-bold text-slate-900">{dep.ai_risk_level?.toUpperCase()}</span>
-                    </p>
-                </div>
+                dep.ai_audit_result.fallback ? (
+                    <div className="mb-6 bg-slate-50 border border-slate-200 rounded-xl p-4">
+                        <h3 className="text-sm font-semibold text-slate-600 mb-1 flex items-center gap-2">
+                            <IconWarning className="w-4 h-4" />
+                            AI unavailable — no risk audit was performed
+                        </h3>
+                        <p className="text-sm text-slate-600">
+                            Check the model id and API key, then run{' '}
+                            <code className="bg-slate-200 px-1 rounded">php artisan autopilot:ai-ping</code>.
+                        </p>
+                        {dep.ai_audit_result.raw && (
+                            <p className="text-xs text-slate-500 mt-1 break-words">{dep.ai_audit_result.raw}</p>
+                        )}
+                    </div>
+                ) : (
+                    <div className="mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4">
+                        <h3 className="text-sm font-semibold text-amber-700 mb-1 flex items-center gap-2">
+                            <IconWarning className="w-4 h-4" />
+                            AI Audit
+                        </h3>
+                        <p className="text-sm text-slate-700">
+                            Risk: <span className="font-bold text-slate-900">{dep.ai_risk_level?.toUpperCase()}</span>
+                        </p>
+                        {Array.isArray(dep.ai_audit_result.warnings) && dep.ai_audit_result.warnings.length > 0 && (
+                            <ul className="mt-2 text-sm text-slate-700 list-disc list-inside space-y-0.5">
+                                {dep.ai_audit_result.warnings.map((w, i) => <li key={i}>{String(w)}</li>)}
+                            </ul>
+                        )}
+                    </div>
+                )
             )}
 
             {/* Phase wizard */}
@@ -298,11 +321,17 @@ export default function DeploymentShow({ deployment: initial }) {
                                         {log.command && <div className="text-slate-400 mb-0.5">$ {log.command}</div>}
                                         {log.output  && <pre className="whitespace-pre-wrap break-words">{log.output}</pre>}
                                         {log.ai_diagnosis && (
-                                            <div className="mt-1 text-amber-700 text-xs">
-                                                AI: {typeof log.ai_diagnosis === 'string'
-                                                    ? log.ai_diagnosis
-                                                    : JSON.stringify(log.ai_diagnosis, null, 2)}
-                                            </div>
+                                            log.ai_diagnosis.fallback ? (
+                                                <div className="mt-1 text-slate-500 text-xs">
+                                                    AI unavailable — check model/API key (php artisan autopilot:ai-ping)
+                                                </div>
+                                            ) : (
+                                                <div className="mt-1 text-amber-700 text-xs">
+                                                    AI: {typeof log.ai_diagnosis === 'string'
+                                                        ? log.ai_diagnosis
+                                                        : JSON.stringify(log.ai_diagnosis, null, 2)}
+                                                </div>
+                                            )
                                         )}
                                     </div>
                                 ))}
