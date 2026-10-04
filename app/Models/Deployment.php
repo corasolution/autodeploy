@@ -10,17 +10,18 @@ class Deployment extends Model
 {
     protected $fillable = [
         'user_id', 'server_id', 'site_id', 'branch', 'with_data', 'with_database',
-        'commit_hash', 'status',
+        'commit_hash', 'status', 'needs_attention',
+        'release_path', 'previous_release',
         'triggered_by', 'ai_risk_level', 'ai_audit_result',
         'started_at', 'finished_at', 'duration_seconds',
     ];
 
     protected $casts = [
         'ai_audit_result' => 'array',
-        'started_at'      => 'datetime',
-        'finished_at'     => 'datetime',
-        'with_data'       => 'boolean',
-        'with_database'   => 'boolean',
+        'started_at' => 'datetime',
+        'finished_at' => 'datetime',
+        'with_data' => 'boolean',
+        'with_database' => 'boolean',
     ];
 
     public function user(): BelongsTo
@@ -57,8 +58,8 @@ class Deployment extends Model
     {
         $started = $this->started_at ?? now();
         $this->update([
-            'status'           => $status,
-            'finished_at'      => now(),
+            'status' => $status,
+            'finished_at' => now(),
             'duration_seconds' => (int) $started->diffInSeconds(now()),
         ]);
     }

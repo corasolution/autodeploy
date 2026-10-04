@@ -50,6 +50,27 @@ class DeployService
 
     private ?AtomicReleaseService $atomic = null;
 
+    /**
+     * DB driver for the SITE being deployed, read from its own .env content.
+     * Defaults to mysql when unset — matches Laravel's own default.
+     */
+    private function siteDbDriver(): string
+    {
+        foreach (explode('
+', (string) $this->site->env_content) as $line) {
+            $line = trim($line);
+            if (str_starts_with($line, 'DB_CONNECTION=')) {
+                $value = strtolower(trim(substr($line, strlen('DB_CONNECTION=')), " 	
+\"'"));
+                if ($value !== '') {
+                    return $value;
+                }
+            }
+        }
+
+        return 'mysql';
+    }
+
     /** Code directory for this deploy: the new release, or deploy_path. */
     private function targetPath(): string
     {
@@ -255,14 +276,25 @@ class DeployService
         $phpOk = version_compare($phpVersion, $minPhp, '>=');
         $this->log(1, 4, $phpOk ? 'success' : 'warning', null, "PHP: {$phpVersion}");
 
-        // Step 5: Check MySQL
-        $result = $this->ssh->exec('mysql --version 2>&1');
-        $this->log(1, 5, str_contains($result['output'], 'mysql') ? 'success' : 'warning',
-            'mysql --version', $result['output']);
+        // Step 5: Check the database client the SITE actually uses (F11).
+        // This used to hardcode `mysql --version`, which warns misleadingly on a
+        // Postgres site. The driver comes from the site's own env_content.
+        $driver = $this->siteDbDriver();
+        $probe = $driver === 'pgsql' ? 'psql --version' : 'mysql --version';
+        $needle = $driver === 'pgsql' ? 'psql' : 'mysql';
+        $result = $this->ssh->exec($probe.' 2>&1');
+        $this->log(1, 5, str_contains(strtolower($result['output'] ?? ''), $needle) ? 'success' : 'warning',
+            $probe, trim($result['output'] ?? ''));
 
-        // Step 6: Snapshot current state
-        $result = $this->ssh->exec('cd '.escapeshellarg($this->site->deploy_path).' && git rev-parse HEAD 2>/dev/null || echo "no-git"');
-        $this->log(1, 6, 'info', 'git rev-parse HEAD', trim($result['output']));
+        // Step 6: Record the rollback target.
+        // The old `git rev-parse HEAD` ran against a deploy path that has no
+        // .git (code arrives by zip), so it always logged "no-git". Atomic sites
+        // record previous_release instead, in beginAtomicRelease().
+        if (! $this->site->isAtomic()) {
+            $this->log(1, 6, 'info', null,
+                'Site is in_place — no previous release is retained, so this deploy cannot be '
+                .'rolled back. Convert it with `php artisan deploy:convert-atomic`.');
+        }
 
         $this->broadcastPhase(1, 'Pre-flight complete');
     }
@@ -769,9 +801,23 @@ class DeployService
                 }
             }
 
+            // F12: escapeshellarg() wraps the value in SINGLE quotes, which was
+            // then embedded inside a double-quoted SQL string — producing
+            // ALTER USER 'name' CREATEDB, invalid in Postgres (identifiers take
+            // double quotes), and mangling the shell quoting besides.
+            //
+            // Validate the identifier instead, then build both layers by hand.
+            if ($dbUser && ! preg_match('/^[A-Za-z0-9_]+$/', $dbUser)) {
+                $this->log(4, 161, 'warning', null,
+                    'Skipping grant_createdb — DB_USERNAME contains characters outside '
+                    .'[A-Za-z0-9_] and cannot be safely interpolated into SQL.');
+                $dbUser = null;
+            }
+
             if ($dbUser) {
-                $safeUser = escapeshellarg($dbUser);
-                $grantCmd = "psql -U postgres -c \"ALTER USER {$safeUser} CREATEDB;\" 2>&1";
+                // Safe: $dbUser is known to match ^[A-Za-z0-9_]+$.
+                $sql = sprintf('ALTER USER "%s" CREATEDB;', $dbUser);
+                $grantCmd = 'psql -U postgres -c '.escapeshellarg($sql).' 2>&1';
                 $grantResult = $this->ssh->exec($grantCmd);
                 $grantExit = $grantResult['exit_code'] ?? 1;
                 $this->log(4, 14, $grantExit === 0 ? 'success' : 'warning',
@@ -970,6 +1016,18 @@ class DeployService
     }
 
     // --- Phase 5 ---
+    /**
+     * Phase 5 — health check (UPGRADE-v2 Phase 3).
+     *
+     * Previously this warned on every outcome and returned true unconditionally,
+     * so phase 6 was unreachable (F4/F8). Now:
+     *   2xx                            → healthy
+     *   4xx                            → healthy, warn "health route missing"
+     *   5xx / connection error (×3)    → UNHEALTHY → rollback on atomic sites
+     *
+     * The default path is /up (Laravel's built-in) rather than /health, which
+     * almost nothing implements.
+     */
     private function phase5HealthCheck(): bool
     {
         $this->log(5, 24, 'info', null, 'Phase 5: Health check');
@@ -977,71 +1035,117 @@ class DeployService
         $appUrl = $this->site->app_url;
         if (! $appUrl) {
             $this->log(5, 24, 'warning', null, 'No app_url configured — skipping HTTP health check');
+            $this->analyseRemoteLogs();
+            $this->broadcastPhase(5, 'Health check skipped');
 
             return true;
         }
 
-        $endpoint = rtrim($appUrl, '/').config('autopilot.health.endpoint', '/health');
-        $ok = true;
+        $path = $this->site->health_path ?: config('autopilot.health.endpoint', '/up');
+        $endpoint = rtrim($appUrl, '/').'/'.ltrim($path, '/');
 
-        try {
-            // SSL verification disabled — we trust the server we just deployed to.
-            // If the deployment broke the app we still see a real 5xx; we don't want a
-            // mis-issued cert (covers `corapos.com` vs `www.corapos.com`) to trigger rollback.
-            $response = Http::withoutVerifying()
-                ->timeout(config('autopilot.health.timeout', 10))
-                ->get($endpoint);
-            $status = $response->status();
-            $expected = config('autopilot.health.expected_codes', [200]);
+        $attempts = (int) config('autopilot.health.retries', 3);
+        $gap = (int) config('autopilot.health.retry_seconds', 5);
+        $verify = $this->site->health_verify_ssl ?? true;
 
-            if (in_array($status, $expected)) {
-                $this->log(5, 24, 'success', "GET {$endpoint}", "HTTP {$status}");
-            } elseif ($status >= 400 && $status < 500) {
-                // 4xx typically means the app is up but /health route doesn't exist.
-                // That's not a deployment failure — warn and continue.
-                $this->log(5, 24, 'warning', "GET {$endpoint}",
-                    "HTTP {$status} — health endpoint not found or not configured. ".
-                    'App appears reachable; skipping rollback. '.
-                    'Add a /health route to the app (or change autopilot.health.endpoint) to get true health verification.');
-            } else {
-                // 5xx / unexpected — warn but don't rollback.
-                // The deploy itself may be fine; the 500 could be a missing
-                // /health route, a temporary DB issue, or an unrelated bug.
-                // Rolling back a successful deploy is more destructive than
-                // leaving it up for manual inspection.
-                $this->log(5, 24, 'warning', "GET {$endpoint}",
-                    "HTTP {$status} — server returned an error. ".
-                    'Deploy will NOT be rolled back automatically. '.
-                    'Check the remote Laravel log for details.');
+        $healthy = false;
+        $lastReason = '';
+
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+            try {
+                $request = Http::timeout(config('autopilot.health.timeout', 10));
+
+                // Verification is ON by default now. A site with a genuinely
+                // broken cert opts out per-site rather than globally.
+                if (! $verify) {
+                    $request = $request->withoutVerifying();
+                }
+
+                $status = $request->get($endpoint)->status();
+
+                if ($status >= 200 && $status < 400) {
+                    $this->log(5, 24, 'success', "GET {$endpoint}", "HTTP {$status} (attempt {$attempt})");
+                    $healthy = true;
+                    break;
+                }
+
+                if ($status >= 400 && $status < 500) {
+                    // The app answered, so it is up — the health route just
+                    // isn't there. Not a deploy failure.
+                    $this->log(5, 24, 'warning', "GET {$endpoint}",
+                        "HTTP {$status} — health route missing. The app responded, so it is "
+                        ."reachable; treating as healthy. Add a {$path} route (Laravel ships /up) "
+                        .'for a real check.');
+                    $healthy = true;
+                    break;
+                }
+
+                $lastReason = "HTTP {$status}";
+            } catch (\Throwable $e) {
+                $lastReason = $e->getMessage();
             }
-        } catch (\Throwable $e) {
-            // Connection error (DNS, timeout, etc.) — warn only, no rollback
+
             $this->log(5, 24, 'warning', "GET {$endpoint}",
-                'Health check unreachable: '.$e->getMessage().' — skipping rollback.');
+                "Attempt {$attempt}/{$attempts} failed: {$lastReason}");
+
+            if ($attempt < $attempts) {
+                sleep($gap);
+            }
         }
 
-        // Step 25-26: Check Laravel logs
+        if (! $healthy) {
+            $this->log(5, 24, 'error', "GET {$endpoint}", sprintf(
+                'Unhealthy after %d attempts (%s). %s',
+                $attempts,
+                $lastReason,
+                $this->site->isAtomic()
+                    ? 'Rolling back to the previous release.'
+                    : 'This site is in_place, so there is nothing to roll back to — '
+                        .'inspect it manually.',
+            ));
+        }
+
+        $this->analyseRemoteLogs();
+        $this->broadcastPhase(5, $healthy ? 'Health check passed' : 'Health check failed');
+
+        // in_place sites have no previous release; rolling "back" would mean
+        // restoring a snapshot that does not exist, so only atomic sites fail
+        // the deploy here.
+        return $healthy || ! $this->site->isAtomic();
+    }
+
+    /**
+     * Steps 25–26: pull the remote log and let Claude triage it.
+     *
+     * Never fails the deploy on its own — an AI opinion is not grounds for an
+     * automatic rollback. A `critical` verdict marks the deployment as needing
+     * attention instead.
+     */
+    private function analyseRemoteLogs(): void
+    {
         $logOutput = $this->getRemoteErrorLog();
         $this->log(5, 25, 'info', null, 'Last 50 lines of Laravel log retrieved');
 
-        if ($logOutput) {
-            try {
-                $analysis = $this->claude->analysePostDeployLogs($logOutput);
-                $aiStatus = $analysis['status'] ?? 'ok';
-                $logStatus = $aiStatus === 'critical' ? 'error' : ($aiStatus === 'warning' ? 'warning' : 'success');
-                $this->log(5, 26, $logStatus, null, 'AI log analysis: '.json_encode($analysis), null, $analysis);
-
-                if ($aiStatus === 'critical') {
-                    $this->log(5, 26, 'warning', null, 'AI flagged critical issues in logs, but rollback is not triggered automatically — inspect logs manually.');
-                }
-            } catch (\Throwable $e) {
-                $this->log(5, 26, 'warning', null, 'AI analysis failed: '.$e->getMessage());
-            }
+        if (! $logOutput) {
+            return;
         }
 
-        $this->broadcastPhase(5, 'Health check complete');
+        try {
+            $analysis = $this->claude->analysePostDeployLogs($logOutput);
+            $aiStatus = $analysis['status'] ?? 'ok';
+            $logStatus = $aiStatus === 'critical' ? 'error' : ($aiStatus === 'warning' ? 'warning' : 'success');
 
-        return $ok ?? false;
+            $this->log(5, 26, $logStatus, null, 'AI log analysis: '.json_encode($analysis), null, $analysis);
+
+            if ($aiStatus === 'critical') {
+                $this->deployment->forceFill(['needs_attention' => true])->save();
+                $this->log(5, 26, 'warning', null,
+                    'AI flagged critical issues in the logs. The deploy is NOT rolled back on an '
+                    .'AI verdict alone — the deployment is marked as needing attention.');
+            }
+        } catch (\Throwable $e) {
+            $this->log(5, 26, 'warning', null, 'AI analysis failed: '.$e->getMessage());
+        }
     }
 
     // --- Phase 6 ---

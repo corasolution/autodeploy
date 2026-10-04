@@ -14,6 +14,7 @@ class Site extends Model
         'pre_migrate_commands', 'php_binary', 'app_url', 'env_content', 'active',
         'webhook_secret', 'environment',
         'release_mode', 'keep_releases', 'maintenance_on_migrate', 'reload_command',
+        'health_path', 'health_verify_ssl',
     ];
 
     protected $hidden = ['env_content', 'webhook_secret'];
@@ -25,6 +26,7 @@ class Site extends Model
         'grant_createdb' => 'boolean',
         'maintenance_on_migrate' => 'boolean',
         'keep_releases' => 'integer',
+        'health_verify_ssl' => 'boolean',
     ];
 
     public function setEnvContentAttribute(?string $value): void

@@ -4,25 +4,25 @@ return [
     'panel_types' => ['cpanel', 'aapanel', 'openpanel'],
 
     'ssh' => [
-        'timeout'      => env('SSH_TIMEOUT', 30),
-        'port'         => env('SSH_PORT', 22),
+        'timeout' => env('SSH_TIMEOUT', 30),
+        'port' => env('SSH_PORT', 22),
         'auth_methods' => ['password', 'key'],
     ],
 
     'claude' => [
-        'api_key'    => env('ANTHROPIC_API_KEY'),
-        'model'      => env('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514'),
+        'api_key' => env('ANTHROPIC_API_KEY'),
+        'model' => env('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514'),
         'max_tokens' => env('ANTHROPIC_MAX_TOKENS', 4096),
-        'api_url'    => 'https://api.anthropic.com/v1/messages',
+        'api_url' => 'https://api.anthropic.com/v1/messages',
     ],
 
     'cpanel' => [
         'default_port' => 2083,
-        'uapi_path'    => '/execute/',
+        'uapi_path' => '/execute/',
     ],
 
     'aapanel' => [
-        'default_port_http'  => 7800,
+        'default_port_http' => 7800,
         'default_port_https' => 7843,
     ],
 
@@ -31,12 +31,12 @@ return [
         // and OpenPanel (per-user account UI, 2083). The REST API lives on the
         // OpenAdmin port — see https://dev.openpanel.com/api/
         'default_admin_port' => 2087,
-        'default_user_port'  => 2083,
-        'api_path'           => '/api/',
+        'default_user_port' => 2083,
+        'api_path' => '/api/',
     ],
 
     'deploy' => [
-        'excluded_paths'   => [
+        'excluded_paths' => [
             '.env',
             'node_modules',
             'vendor',
@@ -88,26 +88,30 @@ return [
             'bootstrap/cache/packages.php',
             'bootstrap/cache/events.php',
         ],
-        'dir_permissions'  => '755',
+        'dir_permissions' => '755',
         'file_permissions' => '644',
-        'writable_dirs'    => ['storage', 'bootstrap/cache'],
-        'writable_perms'   => '775',
-        'snapshots_path'   => storage_path('app/snapshots'),
-        'keep_snapshots'   => 5,
-        'disk_warning_mb'  => 500,
-        'min_php_version'  => '8.2',
+        'writable_dirs' => ['storage', 'bootstrap/cache'],
+        'writable_perms' => '775',
+        'snapshots_path' => storage_path('app/snapshots'),
+        'keep_snapshots' => 5,
+        'disk_warning_mb' => 500,
+        'min_php_version' => '8.2',
     ],
 
     'health' => [
-        'endpoint'       => '/health',
-        'timeout'        => 10,
+        // Laravel ships /up out of the box; the old /health default meant almost
+        // every site 404'd and the check silently degraded to a warning.
+        'endpoint' => env('AUTOPILOT_HEALTH_PATH', '/up'),
+        'timeout' => 10,
+        'retries' => 3,
+        'retry_seconds' => 5,
         'expected_codes' => [200],
     ],
 
     'queue' => [
         'worker_timeout' => 300,
-        'tries'          => 1,
-        'queue_names'    => 'deployments,default',
+        'tries' => 1,
+        'queue_names' => 'deployments,default',
     ],
 
     'tenancy' => [
@@ -120,12 +124,12 @@ return [
     'pgsql' => [
         // pg_dump / psql binaries used to push the local source project's Postgres
         // database to the remote site. Override via .env if not on PATH.
-        'dump_binary'          => env('PGDUMP_BINARY', 'pg_dump'),
-        'client_binary'        => env('PSQL_BINARY', 'psql'),
+        'dump_binary' => env('PGDUMP_BINARY', 'pg_dump'),
+        'client_binary' => env('PSQL_BINARY', 'psql'),
         // Path to psql on the REMOTE server. aaPanel typically installs it at
         // /www/server/pgsql/bin/psql. Override via REMOTE_PSQL_BINARY in .env.
         'remote_client_binary' => env('REMOTE_PSQL_BINARY', '/www/server/pgsql/bin/psql'),
-        'skip_tables'   => [
+        'skip_tables' => [
             // migrations intentionally NOT skipped — full --clean dump must include
             // migrations data so remote `migrate --force` finds all rows and does nothing.
             'cache', 'cache_locks', 'sessions', 'jobs', 'failed_jobs',
