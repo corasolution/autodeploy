@@ -175,6 +175,14 @@ class DeployService
         try {
             $this->phase1PreFlight();
 
+            // Phase 4: AI risk audit. A `high` verdict parks the deploy in
+            // awaiting_approval and stops here — including webhook deploys.
+            if ($this->auditRequiresApproval()) {
+                $this->broadcastPhase(1, 'Awaiting approval');
+
+                return;
+            }
+
             // Phase 2 (atomic): prepare releases/ + shared/ and record what
             // `current` points at, so a failure can swap straight back to it.
             if ($this->site->isAtomic()) {
@@ -1007,6 +1015,12 @@ class DeployService
                 $this->maintenanceOn = false;
             }
 
+            // Phase 4: attach an AI diagnosis to any failed step, so the log
+            // carries a cause and a suggested fix instead of raw stderr.
+            if ($status === 'error') {
+                $this->diagnoseFailedStep(4, $step, $cmd, $result['output'] ?? '');
+            }
+
             if ($status === 'error' && in_array($step, [16, 23])) {
                 throw new RuntimeException("Critical step {$step} failed: ".$result['output']);
             }
@@ -1179,6 +1193,136 @@ class DeployService
             // DB push is invasive; fail loud so the user knows it didn't apply.
             $this->log(4, 162, 'error', null, 'Database push failed: '.$e->getMessage());
             throw $e;
+        }
+    }
+
+    /**
+     * Phase 4: run the pre-deploy config audit and decide whether to proceed.
+     *
+     * Returns true when the deploy should stop and wait for a human. An
+     * already-approved deployment skips the gate, so Approve simply re-queues
+     * the same record.
+     *
+     * Only env KEY NAMES are compared — never values. The audit is advisory, so
+     * any failure inside it is logged and the deploy continues.
+     */
+    private function auditRequiresApproval(): bool
+    {
+        if ($this->deployment->approved_at) {
+            $this->log(1, 162, 'info', null, 'Pre-approved by a user — skipping risk audit.');
+
+            return false;
+        }
+
+        try {
+            $localKeys = $this->envKeys((string) $this->site->env_content);
+            $remoteKeys = $this->envKeys($this->readRemoteEnv());
+
+            $diff = [];
+            foreach (array_diff($localKeys, $remoteKeys) as $key) {
+                $diff[] = "+ {$key} (new in this deploy)";
+            }
+            foreach (array_diff($remoteKeys, $localKeys) as $key) {
+                $diff[] = "- {$key} (present on server, missing locally)";
+            }
+
+            $migrations = $this->pendingMigrations();
+
+            if ($diff === [] && $migrations === []) {
+                $this->log(1, 162, 'success', null, 'Risk audit: no env key changes and no pending migrations.');
+
+                return false;
+            }
+
+            $audit = $this->claude->auditConfig(implode("\n", $diff) ?: '(no env key changes)', $migrations);
+            $risk = strtolower((string) ($audit['risk_level'] ?? 'unknown'));
+
+            $this->deployment->forceFill([
+                'ai_risk_level' => in_array($risk, ['low', 'medium', 'high'], true) ? $risk : null,
+                'ai_audit_result' => $audit,
+            ])->save();
+
+            $gate = (array) config('autopilot.claude.approval_required_levels', ['high']);
+
+            if (! in_array($risk, $gate, true)) {
+                $this->log(1, 162, 'success', null, 'Risk audit: '.$risk.'. '.json_encode($audit));
+
+                return false;
+            }
+
+            $this->deployment->forceFill(['status' => 'awaiting_approval'])->save();
+
+            $this->log(1, 162, 'warning', null,
+                'Risk audit returned HIGH — deployment held for approval. '
+                .'Nothing has been uploaded or changed on the server. '
+                .json_encode($audit));
+
+            return true;
+        } catch (\Throwable $e) {
+            // Advisory only: never block a deploy because the audit broke.
+            $this->log(1, 162, 'warning', null, 'Risk audit skipped: '.$e->getMessage());
+
+            return false;
+        }
+    }
+
+    /** Key names only — values never leave the machine. */
+    private function envKeys(string $env): array
+    {
+        $keys = [];
+
+        foreach (explode("\n", $env) as $line) {
+            $line = trim($line);
+            if ($line === '' || str_starts_with($line, '#') || ! str_contains($line, '=')) {
+                continue;
+            }
+            $keys[] = trim(strstr($line, '=', true));
+        }
+
+        return array_values(array_unique(array_filter($keys)));
+    }
+
+    private function readRemoteEnv(): string
+    {
+        $path = escapeshellarg($this->statePath().'/.env');
+
+        return $this->ssh->exec("cat {$path} 2>/dev/null || true")['output'] ?? '';
+    }
+
+    /**
+     * Pending migrations as reported by the code already on the server. On a
+     * first deploy there is nothing to ask, so this is best-effort.
+     */
+    private function pendingMigrations(): array
+    {
+        $php = escapeshellarg($this->site->php_binary ?: 'php');
+        $path = escapeshellarg($this->site->isAtomic() ? $this->site->currentPath() : $this->site->deploy_path);
+
+        $result = $this->ssh->exec("cd {$path} && {$php} artisan migrate:status --pending 2>/dev/null || true");
+        $lines = array_filter(array_map('trim', explode("\n", $result['output'] ?? '')));
+
+        return array_values(array_filter($lines, fn ($l) => str_contains($l, '_') && ! str_starts_with($l, '+')));
+    }
+
+    /**
+     * Ask Claude what a failed step means and store it on the log row.
+     *
+     * Advisory and best-effort — a diagnosis failure must never replace the
+     * real error the user needs to see.
+     */
+    private function diagnoseFailedStep(int $phase, int $step, ?string $command, string $output): void
+    {
+        if (trim($output) === '') {
+            return;
+        }
+
+        try {
+            $diagnosis = $this->claude->diagnoseError($output, (string) $command);
+
+            $this->log($phase, $step, 'info', null,
+                'AI diagnosis: '.json_encode($diagnosis), null, $diagnosis);
+        } catch (\Throwable $e) {
+            $this->log($phase, $step, 'info', null, 'AI diagnosis unavailable: '.$e->getMessage());
         }
     }
 

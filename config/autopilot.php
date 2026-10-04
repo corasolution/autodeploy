@@ -11,9 +11,17 @@ return [
 
     'claude' => [
         'api_key' => env('ANTHROPIC_API_KEY'),
-        'model' => env('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514'),
-        'max_tokens' => env('ANTHROPIC_MAX_TOKENS', 4096),
+
+        // Two models by workload: log triage is high-volume pattern matching,
+        // diagnosis and risk audit are judgement calls.
+        'model_fast' => env('AUTOPILOT_MODEL_FAST', 'claude-haiku-4-5-20251001'),
+        'model_smart' => env('AUTOPILOT_MODEL_SMART', 'claude-sonnet-5'),
+
+        'max_tokens' => env('ANTHROPIC_MAX_TOKENS', 2048),
         'api_url' => 'https://api.anthropic.com/v1/messages',
+
+        // risk_level values that hold a deploy for manual approval.
+        'approval_required_levels' => ['high'],
     ],
 
     'cpanel' => [

@@ -10,7 +10,7 @@ class Deployment extends Model
 {
     protected $fillable = [
         'user_id', 'server_id', 'site_id', 'branch', 'with_data', 'with_database',
-        'commit_hash', 'status', 'needs_attention',
+        'commit_hash', 'status', 'needs_attention', 'approved_at', 'approved_by',
         'release_path', 'previous_release',
         'triggered_by', 'ai_risk_level', 'ai_audit_result',
         'started_at', 'finished_at', 'duration_seconds',

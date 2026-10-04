@@ -50,6 +50,9 @@ Route::middleware('auth')->group(function () {
     Route::get('/deployments/{deployment}/logs', [LogController::class, 'forDeployment'])->name('deployments.logs');
     // Phase 2: manual rollback — swaps `current` back to this deployment's release.
     Route::post('/deployments/{deployment}/rollback', [DeployController::class, 'rollback'])->name('deployments.rollback');
+    // Phase 4: approval gate for deploys the AI risk audit flagged as high.
+    Route::post('/deployments/{deployment}/approve', [DeployController::class, 'approve'])->name('deployments.approve');
+    Route::post('/deployments/{deployment}/cancel', [DeployController::class, 'cancel'])->name('deployments.cancel');
 
     // Logs
     Route::get('/logs', [LogController::class, 'index'])->name('logs.index');

@@ -301,6 +301,52 @@ class DeployController extends Controller
         }
     }
 
+    /**
+     * Phase 4: approve a deployment the risk audit held back.
+     *
+     * Re-queues the SAME deployment record with approved_at set, so the audit
+     * gate is skipped on the second pass and the log keeps one continuous
+     * history rather than splitting across two deployments.
+     */
+    public function approve(Deployment $deployment): RedirectResponse
+    {
+        $this->authorizeDeployment($deployment);
+
+        if ($deployment->status !== 'awaiting_approval') {
+            return back()->with('error', 'This deployment is not awaiting approval.');
+        }
+
+        $deployment->forceFill([
+            'status' => 'pending',
+            'approved_at' => now(),
+            'approved_by' => auth()->id(),
+        ])->save();
+
+        DeployLog::record($deployment->id, 1, 162, 'info', null,
+            'Approved by '.(auth()->user()?->name ?? 'user').' — resuming deployment.');
+
+        RunDeploymentJob::dispatch($deployment);
+
+        return back()->with('success', 'Deployment approved and re-queued.');
+    }
+
+    public function cancel(Deployment $deployment): RedirectResponse
+    {
+        $this->authorizeDeployment($deployment);
+
+        if ($deployment->status !== 'awaiting_approval') {
+            return back()->with('error', 'Only a deployment awaiting approval can be cancelled.');
+        }
+
+        $deployment->markFinished('failed');
+
+        DeployLog::record($deployment->id, 1, 162, 'warning', null,
+            'Cancelled by '.(auth()->user()?->name ?? 'user').' after a high-risk audit. '
+            .'Nothing was changed on the server.');
+
+        return back()->with('success', 'Deployment cancelled. Nothing was changed on the server.');
+    }
+
     public function poll(Deployment $deployment): JsonResponse
     {
         $this->authorizeDeployment($deployment);
