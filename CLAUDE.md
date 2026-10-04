@@ -4,8 +4,9 @@
 > This file governs how Claude Code operates inside this project.
 > Claude Code must read this file fully before executing any task.
 
-**Active work: implement `docs/UPGRADE-v2.md` phase by phase. Do not start a
-phase until the previous one's acceptance tests pass.**
+**UPGRADE-v2 is complete** (phases 1–6, see `docs/UPGRADE-v2.md` for the
+original spec). Phase 6's VPS move is a runbook, not code — see
+`docs/runbooks/hosting-autopilot.md`.
 
 ---
 
@@ -13,8 +14,8 @@ phase until the previous one's acceptance tests pass.**
 
 **Product:** AutoPilot Deploy — an AI-powered deployment automation tool
 **Purpose:** Automate full-stack deployment of Laravel 13 + React projects to cPanel, aaPanel and OpenPanel servers via SSH, SFTP, and hosting control panel APIs
-**Stack:** Laravel 13 · React (Inertia.js) · MySQL · Tailwind CSS · FilamentPHP v3
-**Powered by:** Claude API (claude-sonnet-4-20250514) for intelligent deployment decisions, error diagnosis, and rollback reasoning
+**Stack:** Laravel 13 · React (Inertia.js) · MySQL · Tailwind CSS
+**Powered by:** Claude API — `claude-sonnet-5` for diagnosis and risk audit, `claude-haiku-4-5-20251001` for log triage
 
 ---
 
@@ -42,8 +43,6 @@ autopilot-deploy/
 │   │   ├── Site.php               # Application per server (many per server)
 │   │   ├── Deployment.php         # Deployment records (has server_id + site_id)
 │   │   └── DeployLog.php          # Per-step logs
-│   └── Filament/
-│       └── Resources/             # FilamentPHP admin UI
 ├── resources/
 │   └── js/
 │       ├── Pages/
@@ -86,9 +85,8 @@ autopilot-deploy/
 | Backend | Laravel | 13.x |
 | Frontend | React + Inertia.js | 18.x / 2.x |
 | Styling | Tailwind CSS | 3.x |
-| Admin UI | FilamentPHP | 3.x |
 | Database | MySQL | 8.x |
-| AI Engine | Claude API | claude-sonnet-4-20250514 |
+| AI Engine | Claude API | claude-sonnet-5 (smart) / claude-haiku-4-5-20251001 (fast) |
 | SSH/SFTP | phpseclib/phpseclib | 3.x |
 | Queue | Laravel Queue (database driver) | — |
 | Realtime | Laravel Echo + Reverb | — |
@@ -115,8 +113,13 @@ DB_PASSWORD=
 
 # Claude AI
 ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-sonnet-4-20250514
-ANTHROPIC_MAX_TOKENS=4096
+AUTOPILOT_MODEL_SMART=claude-sonnet-5
+AUTOPILOT_MODEL_FAST=claude-haiku-4-5-20251001
+ANTHROPIC_MAX_TOKENS=2048
+
+# Deploy notifications (optional)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 
 # SSH defaults
 SSH_TIMEOUT=30
@@ -196,7 +199,7 @@ When deploying, `DeployService` loads `$deployment->site` to get app-specific co
 15. php artisan down --retry=60 --secret={random_token}
 16. php artisan migrate --force  ← CRITICAL: throws on failure
 17. php artisan config:cache
-18. php artisan route:clear  ← NOT route:cache (Filament v3/v4 breaks with cached routes → 405 on POST)
+18. php artisan route:clear  ← NOT route:cache (deployed apps using Filament/Livewire break with cached routes → 405 on POST)
 19. php artisan view:cache
 20. php artisan event:cache
 21. php artisan storage:link (success if "already exists")
@@ -532,7 +535,7 @@ Click **Deploy** on the app. That's it. Autodeploy will:
 - **404 on any route but `/`** → Nginx URL rewrite template not set to `laravel5`.
 - **500 error** → SSH in, `tail -50 {deploy_path}/storage/logs/laravel.log`. Temporarily set `APP_DEBUG=true` in the site's .env textarea, redeploy, see the stack trace, then turn it back off.
 - **"Please close the channel" in live terminal** → should auto-recover now (SshService::exec retries on reconnect). If it doesn't, call `ssh->reconnect()` manually at the offending call site.
-- **Filament type errors after deploy** → your local project uses a different Filament major version than the remote's stale composer lock. Mode B deploy fully replaces vendor/, so just redeploy cleanly.
+- **Filament type errors in a DEPLOYED app** → that app's local Filament major version differs from the remote's stale composer lock. Mode B replaces vendor/ wholesale, so just redeploy cleanly. (AutoPilot itself does not use Filament.)
 
 ---
 
